@@ -369,8 +369,26 @@ async fn handle_post(
         }
 
         "GetProtocolInfo" => {
-            let body = "<Source/><Sink>http-get:*:video/mp4:*,\
-                        http-get:*:application/vnd.apple.mpegurl:*</Sink>";
+            let body = "<Source/><Sink>\
+                        http-get:*:video/mp4:*,\
+                        http-get:*:video/x-matroska:*,\
+                        http-get:*:video/x-msvideo:*,\
+                        http-get:*:video/x-flv:*,\
+                        http-get:*:video/x-ms-wmv:*,\
+                        http-get:*:video/mpeg:*,\
+                        http-get:*:video/webm:*,\
+                        http-get:*:video/3gpp:*,\
+                        http-get:*:video/quicktime:*,\
+                        http-get:*:video/m3u8:*,\
+                        http-get:*:application/vnd.apple.mpegurl:*,\
+                        http-get:*:application/x-mpegURL:*,\
+                        http-get:*:audio/mpeg:*,\
+                        http-get:*:audio/mp4:*,\
+                        http-get:*:audio/x-ms-wma:*,\
+                        http-get:*:audio/flac:*,\
+                        http-get:*:audio/ogg:*,\
+                        http-get:*:audio/wav:*\
+                        </Sink>";
             let xml = descriptors::soap_response("GetProtocolInfo", service, body);
             xml_response(StatusCode::OK, xml)
         }
@@ -419,12 +437,18 @@ async fn handle_subscribe(
     let sid = format!("uuid:{}", uuid::Uuid::new_v4());
     info!("SUBSCRIBE from {callback_url}, SID={sid}");
 
-    // Only store AVTransport subscribers (matching Python behavior)
+    // Only store AVTransport subscribers (matching Python/Macast behavior)
     if path.contains("AVTransport") {
         subscribers
             .lock()
             .await
-            .insert(sid.clone(), callback_url);
+            .insert(sid.clone(), callback_url.clone());
+
+        // UPnP spec: send initial event with current state on new subscription
+        let init_sid = sid.clone();
+        tokio::spawn(async move {
+            send_notify(&callback_url, &init_sid).await;
+        });
     }
 
     Response::builder()

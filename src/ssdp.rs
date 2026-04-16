@@ -129,10 +129,12 @@ impl SsdpAdvertiser {
     }
 
     async fn respond(&self, sock: &UdpSocket, addr: SocketAddr) {
+        let date = httpdate::HttpDate::from(std::time::SystemTime::now());
         for st in SEARCH_TARGETS {
             let msg = format!(
                 "HTTP/1.1 200 OK\r\n\
                  CACHE-CONTROL: max-age=1800\r\n\
+                 DATE: {date}\r\n\
                  LOCATION: {location}\r\n\
                  ST: {st}\r\n\
                  USN: {uuid}::{st}\r\n\

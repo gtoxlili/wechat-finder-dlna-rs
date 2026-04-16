@@ -53,6 +53,7 @@ clap = { version = "4", features = ["derive"] }
 # Encoding
 hex = "0.4"
 html-escape = "0.2"
+httpdate = "1"
 
 # Misc
 uuid = { version = "1", features = ["v4"] }
