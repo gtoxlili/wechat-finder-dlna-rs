@@ -2,9 +2,14 @@
 name = "wechat-finder-dlna"
 version = "0.3.0"
 edition = "2024"
-description = "Capture WeChat Video Channel live streams via fake screen casting (DLNA / AirPlay / Chromecast)"
+description = "Intercept cast stream URLs by impersonating a smart TV — supports DLNA, AirPlay 2, and Chromecast simultaneously"
 license = "GPL-3.0-or-later"
 authors = ["gtoxlili"]
+readme = "README.md"
+repository = "https://github.com/gtoxlili/wechat-finder-dlna-rs"
+homepage = "https://github.com/gtoxlili/wechat-finder-dlna-rs"
+keywords = ["dlna", "airplay", "chromecast", "upnp", "streaming"]
+categories = ["command-line-utilities", "multimedia", "network-programming"]
 
 [lib]
 name = "wechat_finder_dlna"
