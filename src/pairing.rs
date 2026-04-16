@@ -182,72 +182,104 @@ fn srp_n() -> BigUint {
 const SRP_PAD: usize = 384; // 3072 / 8
 const SRP_G: u64 = 5;
 
-fn srp_h_int(parts: &[&[u8]], pad: bool) -> BigUint {
+/// An argument to `srp_hash`.
+enum SrpHashArg<'a> {
+    /// A big integer: converted to minimal big-endian bytes (no leading zeros).
+    Int(&'a BigUint),
+    /// Raw bytes: used as-is.
+    Bytes(&'a [u8]),
+}
+
+/// Python `_H` equivalent.
+///
+/// For each argument:
+///   - `Int(n)`   → minimal big-endian bytes of `n` (same as Python `int.to_bytes(max(1, …), "big")`)
+///   - `Bytes(b)` → `b` as-is
+///
+/// If `pad` is true every part is left-padded with `\x00` to `SRP_PAD` bytes.
+/// All parts are joined with `sep` and hashed with SHA-512.
+/// The digest is returned as a `BigUint` (leading zero bytes are automatically dropped).
+fn srp_hash(args: &[SrpHashArg], pad: bool, sep: &[u8]) -> BigUint {
+    // Build each part as a Vec<u8>.
+    let parts: Vec<Vec<u8>> = args
+        .iter()
+        .map(|a| {
+            let raw: Vec<u8> = match a {
+                SrpHashArg::Int(n) => {
+                    let b = n.to_bytes_be();
+                    // Python: max(1, (n.bit_length() + 7) // 8) bytes
+                    // BigUint::to_bytes_be() returns [] for zero; ensure at least 1 byte.
+                    if b.is_empty() { vec![0u8] } else { b }
+                }
+                SrpHashArg::Bytes(b) => b.to_vec(),
+            };
+            if pad {
+                // left-pad to SRP_PAD
+                if raw.len() < SRP_PAD {
+                    let mut padded = vec![0u8; SRP_PAD - raw.len()];
+                    padded.extend_from_slice(&raw);
+                    padded
+                } else {
+                    raw
+                }
+            } else {
+                raw
+            }
+        })
+        .collect();
+
+    // Join parts with separator and hash.
     let mut hasher = Sha512::new();
-    for &p in parts {
-        if pad && p.len() < SRP_PAD {
-            let mut padded = vec![0u8; SRP_PAD - p.len()];
-            padded.extend_from_slice(p);
-            hasher.update(&padded);
-        } else {
-            hasher.update(p);
+    for (i, part) in parts.iter().enumerate() {
+        if i > 0 && !sep.is_empty() {
+            hasher.update(sep);
         }
+        hasher.update(part);
     }
     BigUint::from_bytes_be(&hasher.finalize())
 }
 
-fn int_to_bytes_pad(n: &BigUint) -> Vec<u8> {
-    let b = n.to_bytes_be();
-    if b.len() < SRP_PAD {
-        let mut padded = vec![0u8; SRP_PAD - b.len()];
-        padded.extend_from_slice(&b);
-        padded
-    } else {
-        b
-    }
-}
-
 struct SrpServer {
-    username: String,
-    _s: BigUint,       // salt (128-bit random)
-    _b: BigUint,       // server private ephemeral
-    _b_pub: BigUint,   // B = k*v + g^b mod N
-    _v: BigUint,       // verifier
-    _a_pub: BigUint,   // client public A (set later)
+    username: Vec<u8>,
+    _s: BigUint,         // salt (random bytes as integer)
+    _b: BigUint,         // server private ephemeral
+    _b_pub: BigUint,     // B = k*v + g^b mod N
+    _v: BigUint,         // verifier
+    _a_pub: BigUint,     // client public A (set later)
     _k_session: BigUint, // session key K = H(S)
-    _m1: BigUint,      // expected client proof M1
-    _m2: BigUint,      // server proof M2
+    _m1: BigUint,        // expected client proof M1
+    _m2: BigUint,        // server proof M2
     n: BigUint,
 }
 
 impl SrpServer {
-    fn new(username: &str, password: &str) -> Self {
+    /// `username` and `password` are raw bytes, matching Python `_SRPServer.__init__`.
+    fn new(username: &[u8], password: &[u8]) -> Self {
         let n = srp_n();
         let g = BigUint::from(SRP_G);
 
-        // k = H(N || g) with padding
-        let k = srp_h_int(&[&int_to_bytes_pad(&n), &int_to_bytes_pad(&g)], false);
+        // k = H(N, g, pad=True)
+        let k = srp_hash(&[SrpHashArg::Int(&n), SrpHashArg::Int(&g)], true, b"");
 
-        // salt: 16 random bytes
+        // salt: 16 random bytes (matches Python _rand(128) → 128-bit)
         let mut salt_bytes = [0u8; 16];
         rand::thread_rng().fill_bytes(&mut salt_bytes);
-        let s = BigUint::from_bytes_be(&salt_bytes) % &n;
+        let s = BigUint::from_bytes_be(&salt_bytes);
 
-        // x = H(salt || H(username:password))
-        let id_hash = {
-            let mut h = Sha512::new();
-            h.update(username.as_bytes());
-            h.update(b":");
-            h.update(password.as_bytes());
-            h.finalize().to_vec()
-        };
-        let s_bytes = s.to_bytes_be();
-        let x = srp_h_int(&[&s_bytes, &id_hash], false);
+        // x = H(s, H(username, password, sep=b":"))
+        // Inner hash: H(username:password) — username and password are bytes args.
+        let inner = srp_hash(
+            &[SrpHashArg::Bytes(username), SrpHashArg::Bytes(password)],
+            false,
+            b":",
+        );
+        // Outer hash: H(s, inner) — s is Int (minimal bytes), inner is Int (minimal bytes).
+        let x = srp_hash(&[SrpHashArg::Int(&s), SrpHashArg::Int(&inner)], false, b"");
 
         // v = g^x mod N
         let v = g.modpow(&x, &n);
 
-        // b: 512-bit random ephemeral
+        // b: 512-bit random ephemeral (matches Python _rand() → default 512-bit)
         let mut b_bytes = [0u8; 64];
         rand::thread_rng().fill_bytes(&mut b_bytes);
         let b = BigUint::from_bytes_be(&b_bytes) % &n;
@@ -256,7 +288,7 @@ impl SrpServer {
         let b_pub = ((&k * &v) + g.modpow(&b, &n)) % &n;
 
         SrpServer {
-            username: username.to_owned(),
+            username: username.to_vec(),
             _s: s,
             _b: b,
             _b_pub: b_pub,
@@ -270,7 +302,9 @@ impl SrpServer {
     }
 
     fn salt_bytes(&self) -> Vec<u8> {
-        self._s.to_bytes_be()
+        // Matches Python _to_bytes(self._s) — minimal big-endian bytes.
+        let b = self._s.to_bytes_be();
+        if b.is_empty() { vec![0u8] } else { b }
     }
 
     fn b_pub_bytes(&self) -> Vec<u8> {
@@ -278,44 +312,61 @@ impl SrpServer {
     }
 
     fn set_client_public(&mut self, a_bytes: &[u8]) {
-        let n = &self.n.clone();
+        let n = self.n.clone();
         let a = BigUint::from_bytes_be(a_bytes);
         self._a_pub = a.clone();
 
-        // u = H(A || B) with padding
-        let a_padded = int_to_bytes_pad(&a);
-        let b_padded = int_to_bytes_pad(&self._b_pub);
-        let u = srp_h_int(&[&a_padded, &b_padded], false);
+        // u = H(A, B, pad=True)
+        let u = srp_hash(
+            &[SrpHashArg::Int(&a), SrpHashArg::Int(&self._b_pub)],
+            true,
+            b"",
+        );
 
-        // S = (A * v^u)^b mod N
-        let s = (a * self._v.modpow(&u, n)).modpow(&self._b, n) % n;
-        let s_bytes = s.to_bytes_be();
-        self._k_session = srp_h_int(&[&s_bytes], false);
+        // S = (A * v^u mod N)^b mod N
+        let s = (a.clone() * self._v.modpow(&u, &n)).modpow(&self._b, &n) % &n;
 
-        // M1 = H( H(N) xor H(g) || H(username) || salt || A || B || K )
-        let hn = srp_h_int(&[&int_to_bytes_pad(n)], false).to_bytes_be();
-        let hg = srp_h_int(&[&int_to_bytes_pad(&BigUint::from(SRP_G))], false).to_bytes_be();
-        let xor: Vec<u8> = hn.iter().zip(hg.iter()).map(|(a, b)| a ^ b).collect();
-        let hu = {
-            let mut h = Sha512::new();
-            h.update(self.username.as_bytes());
-            h.finalize().to_vec()
-        };
-        let k_bytes = self._k_session.to_bytes_be();
-        self._m1 = srp_h_int(
+        // K = H(S)  — S is Int (minimal bytes), no padding, no sep
+        self._k_session = srp_hash(&[SrpHashArg::Int(&s)], false, b"");
+
+        // M1 = H( H(N) ^ H(g),  H(username),  s,  A,  B,  K )
+        //
+        // H(N): hash N's minimal bytes (N is 384 bytes, no leading zeros) — NOT padded
+        // H(g): hash g's minimal bytes (1 byte: \x05)                    — NOT padded
+        // XOR is INTEGER xor of the two BigUint results.
+        let hn: BigUint = srp_hash(&[SrpHashArg::Int(&n)], false, b"");
+        let hg: BigUint = srp_hash(&[SrpHashArg::Int(&BigUint::from(SRP_G))], false, b"");
+        let xor_int: BigUint = hn ^ hg;
+
+        // H(username) — username is bytes
+        let hu: BigUint = srp_hash(&[SrpHashArg::Bytes(&self.username)], false, b"");
+
+        // All args to M1 hash are Int (minimal bytes), no padding, no sep.
+        self._m1 = srp_hash(
             &[
-                &xor,
-                &hu,
-                &self._s.to_bytes_be(),
-                &a_padded,
-                &b_padded,
-                &k_bytes,
+                SrpHashArg::Int(&xor_int),
+                SrpHashArg::Int(&hu),
+                SrpHashArg::Int(&self._s),
+                SrpHashArg::Int(&a),
+                SrpHashArg::Int(&self._b_pub),
+                SrpHashArg::Int(&self._k_session),
             ],
             false,
+            b"",
         );
-        // M2 = H(A || M1 || K)
-        let m1_bytes = self._m1.to_bytes_be();
-        self._m2 = srp_h_int(&[&a_padded, &m1_bytes, &k_bytes], false);
+
+        // M2 = H(A, M1, K)
+        let m1 = self._m1.clone();
+        let k = self._k_session.clone();
+        self._m2 = srp_hash(
+            &[
+                SrpHashArg::Int(&a),
+                SrpHashArg::Int(&m1),
+                SrpHashArg::Int(&k),
+            ],
+            false,
+            b"",
+        );
     }
 
     fn verify_client_proof(&self, proof: &[u8]) -> bool {
@@ -327,8 +378,7 @@ impl SrpServer {
     }
 
     fn session_key_bytes(&self) -> Vec<u8> {
-        // Must be exactly 64 bytes (SHA-512 output), zero-padded on the left,
-        // matching Python: self._K.to_bytes(64, "big")
+        // Exactly 64 bytes: K.to_bytes(64, "big") — left-pad with zeros.
         let b = self._k_session.to_bytes_be();
         if b.len() >= 64 {
             b[b.len() - 64..].to_vec()
@@ -438,7 +488,7 @@ impl HapSession {
         match state {
             // M1: client hello -> M2: salt + B
             0x01 => {
-                let srp = SrpServer::new("Pair-Setup", "3939");
+                let srp = SrpServer::new(b"Pair-Setup", b"3939");
                 let salt = srp.salt_bytes();
                 let b_pub = srp.b_pub_bytes();
                 self.srp = Some(srp);
