@@ -123,7 +123,7 @@ impl SsdpAdvertiser {
                  NT: {nt}\r\n\
                  NTS: ssdp:alive\r\n\
                  USN: {usn}\r\n\
-                 SERVER: UPnP/1.0 DLNADOC/1.50 wechat-finder-dlna/1.0\r\n\
+                 SERVER: Linux/4.9 UPnP/1.0 DLNADOC/1.50 Xiaomi-DLNA/1.0\r\n\
                  \r\n",
                 location = self.location,
             );
@@ -143,7 +143,7 @@ impl SsdpAdvertiser {
                  LOCATION: {location}\r\n\
                  ST: {st}\r\n\
                  USN: {uuid}::{st}\r\n\
-                 SERVER: UPnP/1.0 DLNADOC/1.50 wechat-finder-dlna/1.0\r\n\
+                 SERVER: Linux/4.9 UPnP/1.0 DLNADOC/1.50 Xiaomi-DLNA/1.0\r\n\
                  EXT:\r\n\
                  \r\n",
                 location = self.location,

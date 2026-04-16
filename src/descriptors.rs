@@ -11,9 +11,13 @@ pub fn device_xml(friendly_name: &str, uuid: &str) -> String {
   <specVersion><major>1</major><minor>0</minor></specVersion>
   <device>
     <deviceType>urn:schemas-upnp-org:device:MediaRenderer:1</deviceType>
+    <presentationURL>/</presentationURL>
     <friendlyName>{friendly_name}</friendlyName>
-    <manufacturer>wechat-finder-dlna</manufacturer>
-    <modelName>StreamCatcher</modelName>
+    <manufacturer>Xiaomi</manufacturer>
+    <manufacturerURL>http://www.xiaomi.com/</manufacturerURL>
+    <modelDescription>Xiaomi MediaRenderer</modelDescription>
+    <modelName>Xiaomi MediaRenderer</modelName>
+    <modelURL>http://www.xiaomi.com/</modelURL>
     <UDN>{uuid}</UDN>
     <dlna:X_DLNADOC xmlns:dlna="urn:schemas-dlna-org:device-1-0">DMR-1.50</dlna:X_DLNADOC>
     <serviceList>
