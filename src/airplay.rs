@@ -48,7 +48,24 @@ const FEATURES: u64 = (1 << 48)  // TransientPairing
     | (1 << 4)   // VideoHTTPLiveStreaming
     | (1 << 0); // Video
 
-const DEVICE_ID: &str = "AA:BB:CC:DD:EE:FF";
+/// Derive a stable device ID from the machine's MAC address.
+fn get_device_id() -> String {
+    use network_interface::{Addr, NetworkInterface, NetworkInterfaceConfig};
+    if let Ok(ifaces) = NetworkInterface::show() {
+        for iface in &ifaces {
+            if let Some(mac) = &iface.mac_addr {
+                let mac = mac.to_uppercase();
+                if mac != "00:00:00:00:00:00" && !mac.is_empty() {
+                    return mac;
+                }
+            }
+        }
+    }
+    "AA:BB:CC:DD:EE:FF".to_string()
+}
+
+use std::sync::LazyLock;
+static DEVICE_ID: LazyLock<String> = LazyLock::new(get_device_id);
 const PI: &str = "2e388006-13ba-4041-9a67-25dd4a43d536";
 const SRCVERS: &str = "366.0";
 
@@ -131,7 +148,7 @@ impl AirPlayReceiver {
             .context("failed to parse local IP")?;
 
         let mut properties = HashMap::new();
-        properties.insert("deviceid".to_string(), DEVICE_ID.to_string());
+        properties.insert("deviceid".to_string(), DEVICE_ID.clone());
         properties.insert("features".to_string(), features_mdns);
         properties.insert("flags".to_string(), "0x04".to_string());
         properties.insert("model".to_string(), "AppleTV6,2".to_string());
@@ -579,14 +596,14 @@ fn send_device_info(version: &str, hap: &HapSession, state: &AirPlayState) -> Re
     let features_val: i64 = FEATURES as i64;
 
     let mut d = plist::Dictionary::new();
-    d.insert("deviceID".into(), plist::Value::String(DEVICE_ID.to_string()));
+    d.insert("deviceID".into(), plist::Value::String(DEVICE_ID.clone()));
     d.insert("features".into(), plist::Value::Integer(features_val.into()));
     d.insert("model".into(), plist::Value::String("AppleTV6,2".to_string()));
     d.insert("protocolVersion".into(), plist::Value::String("1.1".to_string()));
     d.insert("sourceVersion".into(), plist::Value::String(SRCVERS.to_string()));
     d.insert("sdk".into(), plist::Value::String("AirPlay;2.0.2".to_string()));
     d.insert("name".into(), plist::Value::String(state.friendly_name.clone()));
-    d.insert("macAddress".into(), plist::Value::String(DEVICE_ID.to_string()));
+    d.insert("macAddress".into(), plist::Value::String(DEVICE_ID.clone()));
     d.insert("pi".into(), plist::Value::String(PI.to_string()));
     d.insert("pk".into(), plist::Value::String(pk_hex));
     d.insert("statusFlags".into(), plist::Value::Integer(4.into()));

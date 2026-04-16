@@ -56,6 +56,8 @@ impl SsdpAdvertiser {
             .context("bind :1900")?;
         raw.join_multicast_v4(&MULTICAST_ADDR, &local_ip)
             .context("IP_ADD_MEMBERSHIP")?;
+        raw.set_multicast_if_v4(&local_ip)
+            .context("IP_MULTICAST_IF")?;
 
         // Wrap into tokio UdpSocket
         let sock = UdpSocket::from_std(raw.into()).context("UdpSocket::from_std")?;
@@ -85,7 +87,10 @@ impl SsdpAdvertiser {
                             if msg.contains("M-SEARCH")
                                 && (msg.contains("MediaRenderer")
                                     || msg.contains("ssdp:all")
-                                    || msg.contains("rootdevice"))
+                                    || msg.contains("rootdevice")
+                                    || msg.contains("AVTransport")
+                                    || msg.contains("RenderingControl")
+                                    || msg.contains("ConnectionManager"))
                             {
                                 self.respond(&sock, addr).await;
                             }
@@ -118,7 +123,7 @@ impl SsdpAdvertiser {
                  NT: {nt}\r\n\
                  NTS: ssdp:alive\r\n\
                  USN: {usn}\r\n\
-                 SERVER: wechat-finder-dlna/1.0 UPnP/1.0\r\n\
+                 SERVER: UPnP/1.0 DLNADOC/1.50 wechat-finder-dlna/1.0\r\n\
                  \r\n",
                 location = self.location,
             );
@@ -138,7 +143,7 @@ impl SsdpAdvertiser {
                  LOCATION: {location}\r\n\
                  ST: {st}\r\n\
                  USN: {uuid}::{st}\r\n\
-                 SERVER: wechat-finder-dlna/1.0 UPnP/1.0\r\n\
+                 SERVER: UPnP/1.0 DLNADOC/1.50 wechat-finder-dlna/1.0\r\n\
                  EXT:\r\n\
                  \r\n",
                 location = self.location,
