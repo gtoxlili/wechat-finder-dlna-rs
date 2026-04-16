@@ -23,13 +23,19 @@ fn html_unescape(s: &str) -> String {
     html_escape::decode_html_entities(s).into_owned()
 }
 
-/// Extract the text content of the first occurrence of `<tag>…</tag>`.
+/// Extract the text content of the first `<tag ...>…</tag>`.
+/// Handles tags with or without attributes (e.g. `<CurrentURI xmlns="...">`)
+/// to match the Python regex `<CurrentURI[^>]*>(.*?)</CurrentURI>`.
 fn extract_tag<'a>(body: &'a str, tag: &str) -> Option<&'a str> {
-    let open = format!("<{tag}>");
+    let open_prefix = format!("<{tag}");
     let close = format!("</{tag}>");
-    let start = body.find(&open)? + open.len();
-    let end = body[start..].find(&close)? + start;
-    Some(&body[start..end])
+    let tag_start = body.find(&open_prefix)?;
+    let after_tag = &body[tag_start + open_prefix.len()..];
+    // Find the closing '>' of the opening tag
+    let gt = after_tag.find('>')?;
+    let content_start = tag_start + open_prefix.len() + gt + 1;
+    let end = body[content_start..].find(&close)? + content_start;
+    Some(&body[content_start..end])
 }
 
 /// Extract the SOAP action name from the SOAPAction header value.
@@ -112,7 +118,7 @@ async fn send_notify(callback_url: &str, sid: &str) {
          NT: upnp:event\r\n\
          NTS: upnp:propchange\r\n\
          SID: {sid}\r\n\
-         SEQ: 1\r\n\
+         SEQ: 0\r\n\
          CONTENT-LENGTH: {body_len}\r\n\
          \r\n\
          {NOTIFY_BODY}"
@@ -346,8 +352,8 @@ async fn handle_post(
         "GetPositionInfo" => {
             let body = "<Track>1</Track>\
                         <TrackDuration>00:00:00</TrackDuration>\
-                        <TrackMetaData>NOT_IMPLEMENTED</TrackMetaData>\
-                        <TrackURI></TrackURI>\
+                        <TrackMetaData/>\
+                        <TrackURI/>\
                         <RelTime>00:00:00</RelTime>\
                         <AbsTime>00:00:00</AbsTime>\
                         <RelCount>0</RelCount>\
@@ -357,15 +363,14 @@ async fn handle_post(
         }
 
         "GetVolume" => {
-            let body = "<CurrentVolume>100</CurrentVolume>";
+            let body = "<CurrentVolume>50</CurrentVolume>";
             let xml = descriptors::soap_response("GetVolume", service, body);
             xml_response(StatusCode::OK, xml)
         }
 
         "GetProtocolInfo" => {
-            let body = "<Source></Source>\
-                        <Sink>http-get:*:video/mp4:*,http-get:*:video/x-flv:*,\
-                        http-get:*:application/vnd.apple.mpegurl:*,http-get:*:video/mpeg:*</Sink>";
+            let body = "<Source/><Sink>http-get:*:video/mp4:*,\
+                        http-get:*:application/vnd.apple.mpegurl:*</Sink>";
             let xml = descriptors::soap_response("GetProtocolInfo", service, body);
             xml_response(StatusCode::OK, xml)
         }
@@ -386,7 +391,7 @@ async fn handle_post(
 
 async fn handle_subscribe(
     req: Request<Incoming>,
-    _path: &str,
+    path: &str,
     subscribers: &Arc<Mutex<HashMap<String, String>>>,
 ) -> Response<Full<Bytes>> {
     // CALLBACK header: <http://192.168.1.x:PORT/path>
@@ -412,10 +417,13 @@ async fn handle_subscribe(
     let sid = format!("uuid:{}", uuid::Uuid::new_v4());
     info!("SUBSCRIBE from {callback_url}, SID={sid}");
 
-    subscribers
-        .lock()
-        .await
-        .insert(sid.clone(), callback_url);
+    // Only store AVTransport subscribers (matching Python behavior)
+    if path.contains("AVTransport") {
+        subscribers
+            .lock()
+            .await
+            .insert(sid.clone(), callback_url);
+    }
 
     Response::builder()
         .status(StatusCode::OK)

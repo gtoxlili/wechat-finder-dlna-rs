@@ -58,7 +58,7 @@ const SRCVERS: &str = "366.0";
 // ---------------------------------------------------------------------------
 
 struct AirPlayState {
-    _friendly_name: String,
+    friendly_name: String,
     ltsk: SigningKey,
     url_tx: Arc<tokio::sync::watch::Sender<Option<String>>>,
     audio_output: Option<String>,
@@ -107,7 +107,7 @@ impl AirPlayReceiver {
         });
 
         let state = Arc::new(AirPlayState {
-            _friendly_name: self.friendly_name.clone(),
+            friendly_name: self.friendly_name.clone(),
             ltsk,
             url_tx: self.url_tx,
             audio_output: self.audio_output,
@@ -513,7 +513,7 @@ async fn handle_request(
     match method {
         // ── GET ──────────────────────────────────────────────────────────
         "GET" => match path {
-            "/server-info" | "/info" => send_device_info(version, hap),
+            "/server-info" | "/info" => send_device_info(version, hap, state),
             "/playback-info" => send_playback_info(version, state),
             _ => ok_empty(version),
         },
@@ -521,7 +521,7 @@ async fn handle_request(
         // ── POST ─────────────────────────────────────────────────────────
         "POST" => match path {
             "/play" => handle_play(version, body, &req.headers, state),
-            "/info" => send_device_info(version, hap),
+            "/info" => send_device_info(version, hap, state),
             "/action" => handle_action(version, body, state),
             "/pair-setup" => {
                 let res = hap.pair_setup(body);
@@ -578,7 +578,7 @@ async fn handle_request(
 // Request-specific helpers
 // ---------------------------------------------------------------------------
 
-fn send_device_info(version: &str, hap: &HapSession) -> Response {
+fn send_device_info(version: &str, hap: &HapSession, state: &AirPlayState) -> Response {
     let pk_hex = hap.public_key_hex();
     let features_val: i64 = FEATURES as i64;
 
@@ -589,7 +589,7 @@ fn send_device_info(version: &str, hap: &HapSession) -> Response {
     d.insert("protocolVersion".into(), plist::Value::String("1.1".to_string()));
     d.insert("sourceVersion".into(), plist::Value::String(SRCVERS.to_string()));
     d.insert("sdk".into(), plist::Value::String("AirPlay;2.0.2".to_string()));
-    d.insert("name".into(), plist::Value::String("AirPlay Receiver".to_string()));
+    d.insert("name".into(), plist::Value::String(state.friendly_name.clone()));
     d.insert("macAddress".into(), plist::Value::String(DEVICE_ID.to_string()));
     d.insert("pi".into(), plist::Value::String(PI.to_string()));
     d.insert("pk".into(), plist::Value::String(pk_hex));

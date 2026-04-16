@@ -463,12 +463,11 @@ impl HapSession {
                     return tlv::encode(&[(tag::STATE, &[0x04]), (tag::ERROR, &[0x04])]);
                 }
                 let m2 = srp.server_proof_bytes();
-                // Derive session key from SRP K via HKDF-SHA-256
-                let k_srp = srp.session_key_bytes();
-                let prk = hkdf_extract_sha256(b"Pair-Setup-Encrypt-Salt", &k_srp);
-                let session_key = hkdf_expand_sha256(&prk, b"Pair-Setup-Encrypt-Info", 32);
-                // Store 32-byte session key for M5 (we reuse shared_key slot temporarily)
-                self.shared_key = Some(session_key);
+                // Store the raw SRP session key (64 bytes) — NOT HKDF-derived.
+                // This matches Python: self.shared_key = self._srp.session_key
+                // The HAP codec later derives Control channel keys from this.
+                self.shared_key = Some(srp.session_key_bytes());
+                self.encrypted = true;
                 tlv::encode(&[(tag::STATE, &[0x04]), (tag::PROOF, &m2)])
             }
             _ => tlv::encode(&[(tag::STATE, &[0x04]), (tag::ERROR, &[0x02])]),
