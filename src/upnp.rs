@@ -381,8 +381,10 @@ async fn handle_post(
         }
 
         _ => {
-            warn!("Unknown SOAP action: {soap_action}");
-            text_response(StatusCode::BAD_REQUEST, "Unknown action")
+            // Python always returns 200 for any SOAP action, even unknown ones.
+            // Some DLNA clients send proprietary actions and expect 200 OK.
+            let xml = descriptors::soap_response(&soap_action, service, "");
+            xml_response(StatusCode::OK, xml)
         }
     }
 }

@@ -422,6 +422,9 @@ impl Response {
             "{} {} {}\r\n",
             self.version, self.status, status_text
         );
+        // Python's BaseHTTPRequestHandler sends Server header automatically.
+        // iOS checks for "AirTunes/" in some pairing flows.
+        out.push_str("Server: AirTunes/366.0\r\n");
         if let Some(cseq) = &self.cseq {
             out.push_str(&format!("CSeq: {}\r\n", cseq));
         }
