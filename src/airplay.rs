@@ -20,12 +20,11 @@ use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use rand::RngCore;
-use regex::Regex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, warn};
 
-use crate::audio_capture::AudioCapture;
+use crate::audio_capture;
 use crate::pairing::{fairplay_setup, HapCodec, HapSession};
 
 // ---------------------------------------------------------------------------
@@ -445,7 +444,7 @@ impl Response {
 async fn handle_connection(stream: TcpStream, state: Arc<AirPlayState>) -> Result<()> {
     let mut conn = ConnBuf::new(stream);
     let mut hap = HapSession::new(state.ltsk.clone());
-    let mut audio_cap: Option<Arc<AudioCapture>> = None;
+    let mut audio_port: Option<u16> = None;
     // Whether we've already enabled HAP encryption on this connection
     let mut is_encrypted = false;
 
@@ -468,7 +467,7 @@ async fn handle_connection(stream: TcpStream, state: Arc<AirPlayState>) -> Resul
         let resp = handle_request(
             &req,
             &mut hap,
-            &mut audio_cap,
+            &mut audio_port,
             &state,
         )
         .await;
@@ -492,15 +491,13 @@ async fn handle_connection(stream: TcpStream, state: Arc<AirPlayState>) -> Resul
         }
     }
 
-    // Tear down audio capture if still running
-    drop(audio_cap);
     Ok(())
 }
 
 async fn handle_request(
     req: &Request,
     hap: &mut HapSession,
-    audio_cap: &mut Option<Arc<AudioCapture>>,
+    audio_port: &mut Option<u16>,
     state: &Arc<AirPlayState>,
 ) -> Response {
     let version = &req.version;
@@ -552,13 +549,9 @@ async fn handle_request(
                  TEARDOWN, OPTIONS, GET_PARAMETER, SET_PARAMETER, POST, GET",
             ),
 
-        "SETUP" => handle_setup(version, body, audio_cap, state).await,
+        "SETUP" => handle_setup(version, body, audio_port, state).await,
 
-        "TEARDOWN" => {
-            // Stop audio capture
-            drop(audio_cap.take());
-            ok_empty(version)
-        }
+        "TEARDOWN" => ok_empty(version),
 
         "GET_PARAMETER" => {
             if body.windows(6).any(|w| w == b"volume") {
@@ -648,9 +641,15 @@ fn handle_play(
 
     if url.is_none() {
         if let Ok(text) = std::str::from_utf8(body) {
-            if let Ok(re) = Regex::new(r"Content-Location:\s*(.+)") {
-                if let Some(cap) = re.captures(text) {
-                    url = Some(cap[1].trim().to_string());
+            // Simple string search replaces regex r"Content-Location:\s*(.+)"
+            for line in text.lines() {
+                let trimmed = line.trim();
+                if let Some(rest) = trimmed.strip_prefix("Content-Location:") {
+                    let val = rest.trim();
+                    if !val.is_empty() {
+                        url = Some(val.to_string());
+                        break;
+                    }
                 }
             }
         }
@@ -686,7 +685,7 @@ fn handle_action(version: &str, body: &[u8], state: &Arc<AirPlayState>) -> Respo
 async fn handle_setup(
     version: &str,
     body: &[u8],
-    audio_cap: &mut Option<Arc<AudioCapture>>,
+    audio_port: &mut Option<u16>,
     state: &Arc<AirPlayState>,
 ) -> Response {
     if body.is_empty() {
@@ -699,7 +698,6 @@ async fn handle_setup(
     };
 
     if let Some(plist::Value::Array(streams)) = setup_plist.get("streams") {
-        // Audio stream setup
         let mut streams_resp: Vec<plist::Value> = Vec::new();
 
         for stream_val in streams {
@@ -728,25 +726,20 @@ async fn handle_setup(
                 .unwrap_or(96);
 
             let data_port = if let Some(output_path) = &state.audio_output {
-                if audio_cap.is_none() {
-                    match AudioCapture::new() {
-                        Ok(cap) => {
-                            let port = cap.port();
-                            let cap = Arc::new(cap);
-                            let cap_clone = cap.clone();
+                if audio_port.is_none() {
+                    match audio_capture::bind_capture_socket() {
+                        Ok((socket, port)) => {
                             let output = output_path.clone();
                             let dur = state.audio_duration;
                             let url_tx = state.url_tx.clone();
                             tokio::spawn(async move {
-                                // AudioCapture::run consumes self; we need an owned value.
-                                // Arc doesn't support moving out, so we use try_unwrap or
-                                // a helper.  Since we just created it, try_unwrap should work.
-                                if let Ok(owned) = Arc::try_unwrap(cap_clone) {
-                                    let _ = owned.run(output, shk, dur, url_tx).await;
-                                }
+                                let _ = audio_capture::run_capture(
+                                    socket, port, output, shk, dur, url_tx,
+                                )
+                                .await;
                             });
-                            *audio_cap = Some(cap);
-                            eprintln!("  Recording audio → {}", output_path);
+                            *audio_port = Some(port);
+                            eprintln!("  🎙️ Recording audio → {}", output_path);
                             port
                         }
                         Err(e) => {
@@ -755,7 +748,7 @@ async fn handle_setup(
                         }
                     }
                 } else {
-                    audio_cap.as_ref().map(|c| c.port()).unwrap_or(7100)
+                    audio_port.unwrap_or(7100)
                 }
             } else {
                 7100

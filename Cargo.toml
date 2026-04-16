@@ -15,8 +15,11 @@ name = "wechat-finder-dlna"
 path = "src/main.rs"
 
 [dependencies]
-# Async runtime
-tokio = { version = "1", features = ["full"] }
+# Async runtime — only the features we actually use
+tokio = { version = "1", features = [
+    "rt-multi-thread", "net", "sync", "macros",
+    "time", "signal", "fs", "process", "io-util",
+] }
 
 # HTTP server
 hyper = { version = "1", features = ["server", "http1"] }
@@ -40,8 +43,6 @@ hmac = "0.12"
 sha2 = "0.10"
 rand = "0.8"
 num-bigint = "0.4"
-num-traits = "0.2"
-num-integer = "0.1"
 
 # Plist
 plist = "1"
@@ -54,9 +55,7 @@ hex = "0.4"
 html-escape = "0.2"
 
 # Misc
-regex = "1"
 uuid = { version = "1", features = ["v4"] }
-serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
@@ -65,4 +64,3 @@ anyhow = "1"
 socket2 = "0.5"
 network-interface = "2"
 which = "7"
-

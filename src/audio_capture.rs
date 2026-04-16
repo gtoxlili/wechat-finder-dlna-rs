@@ -20,110 +20,98 @@ use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use tokio::net::UdpSocket;
 use tracing::{debug, warn};
 
-pub struct AudioCapture {
-    socket: UdpSocket,
-    port: u16,
+/// Bind a UDP socket on an OS-assigned port and return `(socket, port)`.
+/// The port is needed immediately for the SETUP response; the socket
+/// ownership is transferred to the capture task.
+pub fn bind_capture_socket() -> Result<(UdpSocket, u16)> {
+    let std_sock =
+        std::net::UdpSocket::bind("0.0.0.0:0").context("failed to bind UDP socket")?;
+    std_sock
+        .set_nonblocking(true)
+        .context("failed to set non-blocking")?;
+    let port = std_sock
+        .local_addr()
+        .context("failed to get local addr")?
+        .port();
+    let socket = UdpSocket::from_std(std_sock).context("failed to convert to tokio socket")?;
+    Ok((socket, port))
 }
 
-impl AudioCapture {
-    /// Bind a UDP socket on an OS-assigned port and return the capture handle.
-    pub fn new() -> Result<Self> {
-        // Bind synchronously so the caller can immediately query the port,
-        // then convert the `std` socket into a Tokio socket.
-        let std_sock =
-            std::net::UdpSocket::bind("0.0.0.0:0").context("failed to bind UDP socket")?;
-        std_sock
-            .set_nonblocking(true)
-            .context("failed to set non-blocking")?;
-        let port = std_sock
-            .local_addr()
-            .context("failed to get local addr")?
-            .port();
-        let socket = UdpSocket::from_std(std_sock).context("failed to convert to tokio socket")?;
-        Ok(Self { socket, port })
-    }
+/// Receive RTP packets until `duration` seconds have elapsed (or forever if
+/// `duration` is `None`), writing ADTS-wrapped AAC frames to `output_path`.
+///
+/// When finished, sends `Some(output_path)` on `on_done`.
+pub async fn run_capture(
+    socket: UdpSocket,
+    port: u16,
+    output_path: String,
+    shk: Option<Vec<u8>>,
+    duration: Option<f64>,
+    on_done: Arc<tokio::sync::watch::Sender<Option<String>>>,
+) -> Result<()> {
+    let cipher: Option<ChaCha20Poly1305> = shk
+        .as_deref()
+        .map(|key| ChaCha20Poly1305::new_from_slice(key))
+        .transpose()
+        .context("invalid SHK length for ChaCha20-Poly1305")?;
 
-    /// The UDP port this capture instance is listening on.
-    pub fn port(&self) -> u16 {
-        self.port
-    }
+    let deadline = duration.map(|secs| Instant::now() + Duration::from_secs_f64(secs));
 
-    /// Receive RTP packets until `duration` seconds have elapsed (or forever if
-    /// `duration` is `None`), writing ADTS-wrapped AAC frames to `output_path`.
-    ///
-    /// When finished, sends `Some(output_path)` on `on_done`.
-    pub async fn run(
-        self,
-        output_path: String,
-        shk: Option<Vec<u8>>,
-        duration: Option<f64>,
-        on_done: Arc<tokio::sync::watch::Sender<Option<String>>>,
-    ) -> Result<()> {
-        let cipher: Option<ChaCha20Poly1305> = shk
-            .as_deref()
-            .map(|key| ChaCha20Poly1305::new_from_slice(key))
-            .transpose()
-            .context("invalid SHK length for ChaCha20-Poly1305")?;
+    let mut file = tokio::fs::File::create(&output_path)
+        .await
+        .with_context(|| format!("failed to create output file: {output_path}"))?;
 
-        let deadline = duration.map(|secs| Instant::now() + Duration::from_secs_f64(secs));
+    let mut buf = vec![0u8; 8192];
+    let mut pkt_count: u64 = 0;
 
-        let mut file = tokio::fs::File::create(&output_path)
-            .await
-            .with_context(|| format!("failed to create output file: {output_path}"))?;
+    debug!(
+        "AudioCapture: listening on UDP :{} → {} (shk={}, duration={:?})",
+        port,
+        output_path,
+        if cipher.is_some() { "yes" } else { "no" },
+        duration,
+    );
 
-        let mut buf = vec![0u8; 8192];
-        let mut pkt_count: u64 = 0;
-
-        debug!(
-            "AudioCapture: listening on UDP :{} → {} (shk={}, duration={:?})",
-            self.port,
-            output_path,
-            if cipher.is_some() { "yes" } else { "no" },
-            duration,
-        );
-
-        loop {
-            // Check duration limit.
-            if let Some(dl) = deadline {
-                if Instant::now() >= dl {
-                    debug!("AudioCapture: duration limit reached");
+    loop {
+        if let Some(dl) = deadline {
+            if Instant::now() >= dl {
+                debug!("AudioCapture: duration limit reached");
+                break;
+            }
+            let remaining = dl - Instant::now();
+            let recv = tokio::time::timeout(remaining, socket.recv(&mut buf));
+            match recv.await {
+                Err(_elapsed) => break,
+                Ok(Err(e)) => {
+                    warn!("AudioCapture: recv error: {e}");
                     break;
                 }
-                let remaining = dl - Instant::now();
-                let recv = tokio::time::timeout(remaining, self.socket.recv(&mut buf));
-                match recv.await {
-                    Err(_elapsed) => break,
-                    Ok(Err(e)) => {
-                        warn!("AudioCapture: recv error: {e}");
-                        break;
-                    }
-                    Ok(Ok(n)) => {
-                        if let Some(audio) = handle_packet(&buf[..n], cipher.as_ref()) {
-                            write_frame(&mut file, &audio).await?;
-                            pkt_count += 1;
-                        }
+                Ok(Ok(n)) => {
+                    if let Some(audio) = handle_packet(&buf[..n], cipher.as_ref()) {
+                        write_frame(&mut file, &audio).await?;
+                        pkt_count += 1;
                     }
                 }
-            } else {
-                match self.socket.recv(&mut buf).await {
-                    Err(e) => {
-                        warn!("AudioCapture: recv error: {e}");
-                        break;
-                    }
-                    Ok(n) => {
-                        if let Some(audio) = handle_packet(&buf[..n], cipher.as_ref()) {
-                            write_frame(&mut file, &audio).await?;
-                            pkt_count += 1;
-                        }
+            }
+        } else {
+            match socket.recv(&mut buf).await {
+                Err(e) => {
+                    warn!("AudioCapture: recv error: {e}");
+                    break;
+                }
+                Ok(n) => {
+                    if let Some(audio) = handle_packet(&buf[..n], cipher.as_ref()) {
+                        write_frame(&mut file, &audio).await?;
+                        pkt_count += 1;
                     }
                 }
             }
         }
-
-        debug!("AudioCapture: stopped, {pkt_count} packets captured");
-        let _ = on_done.send(Some(output_path));
-        Ok(())
     }
+
+    debug!("AudioCapture: stopped, {pkt_count} packets captured");
+    let _ = on_done.send(Some(output_path));
+    Ok(())
 }
 
 /// Decode one RTP packet and return the raw AAC frame, or `None` if the packet
@@ -145,7 +133,6 @@ fn handle_packet(data: &[u8], cipher: Option<&ChaCha20Poly1305>) -> Option<Vec<u
 
     if let Some(cipher) = cipher {
         // Build 12-byte nonce: left-pad 8-byte nonce with 4 zero bytes.
-        // This matches PyCryptodome's behaviour for 8-byte nonces.
         let mut nonce_arr = [0u8; 12];
         nonce_arr[4..].copy_from_slice(nonce_bytes);
         let nonce = Nonce::from(nonce_arr);
