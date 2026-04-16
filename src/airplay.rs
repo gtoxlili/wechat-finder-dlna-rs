@@ -27,10 +27,6 @@ use tracing::{debug, error, warn};
 use crate::audio_capture;
 use crate::pairing::{fairplay_setup, HapCodec, HapSession};
 
-// ---------------------------------------------------------------------------
-// AirPlay 2 feature flags (64-bit)
-// ---------------------------------------------------------------------------
-
 const FEATURES: u64 = (1 << 48)  // TransientPairing
     | (1 << 47)  // PeerManagement
     | (1 << 46)  // HomeKitPairing
@@ -69,10 +65,6 @@ static DEVICE_ID: LazyLock<String> = LazyLock::new(get_device_id);
 const PI: &str = "2e388006-13ba-4041-9a67-25dd4a43d536";
 const SRCVERS: &str = "366.0";
 
-// ---------------------------------------------------------------------------
-// Shared receiver state (one instance per server lifetime)
-// ---------------------------------------------------------------------------
-
 struct AirPlayState {
     friendly_name: String,
     ltsk: SigningKey,
@@ -81,10 +73,6 @@ struct AirPlayState {
     audio_duration: Option<f64>,
     captured: std::sync::atomic::AtomicBool,
 }
-
-// ---------------------------------------------------------------------------
-// Public struct
-// ---------------------------------------------------------------------------
 
 pub struct AirPlayReceiver {
     friendly_name: String,
@@ -115,7 +103,6 @@ impl AirPlayReceiver {
     }
 
     pub async fn run(self, mut stop_rx: tokio::sync::watch::Receiver<()>) -> Result<()> {
-        // Generate Ed25519 long-term signing key
         let ltsk = SigningKey::from_bytes(&{
             let mut seed = [0u8; 32];
             rand::thread_rng().fill_bytes(&mut seed);
@@ -131,7 +118,6 @@ impl AirPlayReceiver {
             captured: std::sync::atomic::AtomicBool::new(false),
         });
 
-        // Advertise via mDNS
         let mdns = ServiceDaemon::new().context("failed to create mDNS daemon")?;
         let pk_hex = state.ltsk.verifying_key().to_bytes().iter().fold(String::new(), |mut s, b| {
             use std::fmt::Write;
@@ -176,7 +162,6 @@ impl AirPlayReceiver {
             self.local_ip, self.port
         );
 
-        // Bind TCP listener
         let listener = TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], self.port)))
             .await
             .context("failed to bind AirPlay TCP listener")?;
@@ -210,10 +195,6 @@ impl AirPlayReceiver {
         Ok(())
     }
 }
-
-// ---------------------------------------------------------------------------
-// Per-connection handler
-// ---------------------------------------------------------------------------
 
 /// Read/write buffer that optionally passes traffic through a HapCodec.
 struct ConnBuf {
@@ -253,10 +234,6 @@ impl ConnBuf {
     }
 }
 
-// ---------------------------------------------------------------------------
-// HTTP/RTSP request parsing
-// ---------------------------------------------------------------------------
-
 struct Request {
     method: String,
     path: String,
@@ -267,7 +244,6 @@ struct Request {
 
 /// Read and parse one HTTP/RTSP request from the connection buffer.
 async fn read_request(conn: &mut ConnBuf) -> Result<Request> {
-    // Read until we find "\r\n\r\n"
     loop {
         let search_from = conn.plain_buf.len().saturating_sub(3);
         if let Some(pos) = find_bytes(&conn.plain_buf[search_from..], b"\r\n\r\n") {
@@ -281,7 +257,6 @@ async fn read_request(conn: &mut ConnBuf) -> Result<Request> {
             let header_str = String::from_utf8_lossy(&replaced);
             let mut lines = header_str.lines();
 
-            // Request line
             let req_line = lines.next().unwrap_or("").trim();
             let mut parts = req_line.splitn(3, ' ');
             let method = parts.next().unwrap_or("GET").to_string();
@@ -304,7 +279,6 @@ async fn read_request(conn: &mut ConnBuf) -> Result<Request> {
                 version_raw.to_string()
             };
 
-            // Headers
             let mut headers: HashMap<String, String> = HashMap::new();
             for line in lines {
                 let line = line.trim();
@@ -318,14 +292,12 @@ async fn read_request(conn: &mut ConnBuf) -> Result<Request> {
                 }
             }
 
-            // Body
             let content_length: usize = headers
                 .get("content-length")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0);
 
             if content_length > 0 {
-                // Ensure we have the full body
                 while conn.plain_buf.len() < content_length {
                     let mut tmp = [0u8; 4096];
                     let nread = conn
@@ -352,7 +324,6 @@ async fn read_request(conn: &mut ConnBuf) -> Result<Request> {
             return Ok(Request { method, path, version, headers, body: Vec::new() });
         }
 
-        // Need more data
         let mut tmp = [0u8; 4096];
         let nread = conn
             .stream
@@ -393,10 +364,6 @@ impl SliceReplace for Vec<u8> {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Response builder
-// ---------------------------------------------------------------------------
 
 struct Response {
     status: u16,
@@ -457,15 +424,10 @@ impl Response {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Connection handler
-// ---------------------------------------------------------------------------
-
 async fn handle_connection(stream: TcpStream, state: Arc<AirPlayState>) -> Result<()> {
     let mut conn = ConnBuf::new(stream);
     let mut hap = HapSession::new(state.ltsk.clone());
     let mut audio_port: Option<u16> = None;
-    // Whether we've already enabled HAP encryption on this connection
     let mut is_encrypted = false;
 
     loop {
@@ -501,7 +463,6 @@ async fn handle_connection(stream: TcpStream, state: Arc<AirPlayState>) -> Resul
             break;
         }
 
-        // Upgrade to HAP encryption if pair-setup/pair-verify just completed
         if hap.is_encrypted() && !is_encrypted {
             if let Some(key) = hap.shared_key() {
                 conn.enable_encryption(key);
@@ -528,14 +489,12 @@ async fn handle_request(
     debug!("AirPlay: {} {}", method, path);
 
     match method {
-        // ── GET ──────────────────────────────────────────────────────────
         "GET" => match path {
             "/server-info" | "/info" => send_device_info(version, hap, state),
             "/playback-info" => send_playback_info(version, state),
             _ => ok_empty(version),
         },
 
-        // ── POST ─────────────────────────────────────────────────────────
         "POST" => match path {
             "/play" => handle_play(version, body, &req.headers, state),
             "/info" => send_device_info(version, hap, state),
@@ -558,10 +517,8 @@ async fn handle_request(
             _ => ok_empty(version),
         },
 
-        // ── PUT ──────────────────────────────────────────────────────────
         "PUT" => ok_empty(version),
 
-        // ── RTSP ─────────────────────────────────────────────────────────
         "OPTIONS" => Response::new(version, 200, Vec::new(), "application/octet-stream")
             .with_header(
                 "Public",
@@ -586,10 +543,6 @@ async fn handle_request(
         _ => ok_empty(version),
     }
 }
-
-// ---------------------------------------------------------------------------
-// Request-specific helpers
-// ---------------------------------------------------------------------------
 
 fn send_device_info(version: &str, hap: &HapSession, state: &AirPlayState) -> Response {
     let pk_hex = hap.public_key_hex();
@@ -661,7 +614,6 @@ fn handle_play(
 
     if url.is_none() {
         if let Ok(text) = std::str::from_utf8(body) {
-            // Simple string search replaces regex r"Content-Location:\s*(.+)"
             for line in text.lines() {
                 let trimmed = line.trim();
                 if let Some(rest) = trimmed.strip_prefix("Content-Location:") {

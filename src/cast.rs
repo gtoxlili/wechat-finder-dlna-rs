@@ -151,10 +151,7 @@ impl CastReceiver {
     }
 
     pub async fn run(self, mut stop_rx: tokio::sync::watch::Receiver<()>) -> Result<()> {
-        // Generate self-signed TLS certificate
         let tls_acceptor = build_tls_acceptor()?;
-
-        // Start TCP listener
         let listener = TcpListener::bind(format!("0.0.0.0:{}", self.port))
             .await
             .with_context(|| format!("Failed to bind Cast TLS server on port {}", self.port))?;
@@ -163,7 +160,6 @@ impl CastReceiver {
             self.friendly_name, self.local_ip, self.port
         );
 
-        // Advertise via mDNS
         let mdns = ServiceDaemon::new().context("Failed to create mDNS daemon")?;
         let device_id = Uuid::new_v4().to_string().to_uppercase();
         let cast_id = format!("{:X}", rand_hex_u64());
@@ -265,7 +261,6 @@ async fn handle_cast_connection(
     url_tx: Arc<tokio::sync::watch::Sender<Option<String>>>,
 ) -> Result<()> {
     loop {
-        // Read 4-byte big-endian length prefix
         let mut len_buf = [0u8; 4];
         match stream.read_exact(&mut len_buf).await {
             Ok(_) => {}
@@ -342,7 +337,6 @@ async fn handle_cast_connection(
                 let request_id = payload.get("requestId").and_then(|v| v.as_i64()).unwrap_or(0);
                 match msg_type {
                     "LOAD" => {
-                        // Extract URL from media object
                         let url = extract_url_from_load(&payload);
                         if let Some(ref u) = url {
                             info!("Cast: received media URL: {}", u);
@@ -381,7 +375,6 @@ async fn handle_cast_connection(
 }
 
 fn extract_url_from_load(payload: &Value) -> Option<String> {
-    // Try media.contentUrl first, then media.contentId
     let media = payload.get("media")?;
 
     if let Some(url) = media.get("contentUrl").and_then(|v| v.as_str()) {

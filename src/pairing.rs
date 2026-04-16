@@ -9,9 +9,6 @@ use rand::RngCore;
 use sha2::{Digest, Sha512};
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey};
 
-// ---------------------------------------------------------------------------
-// TLV8 tags
-// ---------------------------------------------------------------------------
 #[allow(dead_code)]
 mod tag {
     pub const IDENTIFIER: u8 = 1;
@@ -26,9 +23,6 @@ mod tag {
     pub const METHOD: u8 = 0;
 }
 
-// ---------------------------------------------------------------------------
-// TLV8 codec
-// ---------------------------------------------------------------------------
 pub mod tlv {
     use std::collections::HashMap;
 
@@ -71,10 +65,6 @@ pub mod tlv {
     }
 }
 
-// ---------------------------------------------------------------------------
-// HKDF helpers (HMAC-SHA-256 based, single-block expand)
-// ---------------------------------------------------------------------------
-
 fn hkdf_extract_sha256(salt: &[u8], ikm: &[u8]) -> Vec<u8> {
     let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(salt).expect("HMAC accepts any key size");
     mac.update(ikm);
@@ -88,14 +78,6 @@ fn hkdf_expand_sha256(prk: &[u8], info: &[u8], length: usize) -> Vec<u8> {
     mac.update(&[0x01u8]);
     mac.finalize().into_bytes()[..length].to_vec()
 }
-
-// ---------------------------------------------------------------------------
-// ChaCha20-Poly1305 helpers (12-byte nonce, zero-padded from 8-byte counter)
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// ChaCha20-Poly1305 helpers
-// ---------------------------------------------------------------------------
 
 /// Pad a nonce to 12 bytes by left-padding with zeros (matching Python rjust).
 fn pad_nonce(nonce_bytes: &[u8]) -> Nonce {
@@ -153,10 +135,6 @@ fn hap_chacha_decrypt(
     cipher.decrypt(&nonce, Payload { msg: ciphertext, aad })
 }
 
-// ---------------------------------------------------------------------------
-// SRP-6a (3072-bit, SHA-512, g=5)
-// ---------------------------------------------------------------------------
-
 /// The 3072-bit safe prime N from RFC 5054.
 fn srp_n() -> BigUint {
     BigUint::parse_bytes(
@@ -200,7 +178,6 @@ enum SrpHashArg<'a> {
 /// All parts are joined with `sep` and hashed with SHA-512.
 /// The digest is returned as a `BigUint` (leading zero bytes are automatically dropped).
 fn srp_hash(args: &[SrpHashArg], pad: bool, sep: &[u8]) -> BigUint {
-    // Build each part as a Vec<u8>.
     let parts: Vec<Vec<u8>> = args
         .iter()
         .map(|a| {
@@ -390,10 +367,6 @@ impl SrpServer {
     }
 }
 
-// ---------------------------------------------------------------------------
-// FairPlay stub
-// ---------------------------------------------------------------------------
-
 static FP_REPLIES: [&[u8]; 4] = [
     b"\x46\x50\x4c\x59\x03\x01\x02\x00\x00\x00\x00\x82\x02\x00\x0f\x9f\x3f\x9e\x0a\x25\x21\xdb\xdf\x31\x2a\xb2\xbf\xb2\x9e\x8d\x23\x2b\x63\x76\xa8\xc8\x18\x70\x1d\x22\xae\x93\xd8\x27\x37\xfe\xaf\x9d\xb4\xfd\xf4\x1c\x2d\xba\x9d\x1f\x49\xca\xaa\xbf\x65\x91\xac\x1f\x7b\xc6\xf7\xe0\x66\x3d\x21\xaf\xe0\x15\x65\x95\x3e\xab\x81\xf4\x18\xce\xed\x09\x5a\xdb\x7c\x3d\x0e\x25\x49\x09\xa7\x98\x31\xd4\x9c\x39\x82\x97\x34\x34\xfa\xcb\x42\xc6\x3a\x1c\xd9\x11\xa6\xfe\x94\x1a\x8a\x6d\x4a\x74\x3b\x46\xc3\xa7\x64\x9e\x44\xc7\x89\x55\xe4\x9d\x81\x55\x00\x95\x49\xc4\xe2\xf7\xa3\xf6\xd5\xba",
     b"\x46\x50\x4c\x59\x03\x01\x02\x00\x00\x00\x00\x82\x02\x01\xcf\x32\xa2\x57\x14\xb2\x52\x4f\x8a\xa0\xad\x7a\xf1\x64\xe3\x7b\xcf\x44\x24\xe2\x00\x04\x7e\xfc\x0a\xd6\x7a\xfc\xd9\x5d\xed\x1c\x27\x30\xbb\x59\x1b\x96\x2e\xd6\x3a\x9c\x4d\xed\x88\xba\x8f\xc7\x8d\xe6\x4d\x91\xcc\xfd\x5c\x7b\x56\xda\x88\xe3\x1f\x5c\xce\xaf\xc7\x43\x19\x95\xa0\x16\x65\xa5\x4e\x19\x39\xd2\x5b\x94\xdb\x64\xb9\xe4\x5d\x8d\x06\x3e\x1e\x6a\xf0\x7e\x96\x56\x16\x2b\x0e\xfa\x40\x42\x75\xea\x5a\x44\xd9\x59\x1c\x72\x56\xb9\xfb\xe6\x51\x38\x98\xb8\x02\x27\x72\x19\x88\x57\x16\x50\x94\x2a\xd9\x46\x68\x8a",
@@ -431,10 +404,6 @@ pub fn fairplay_setup(request: &[u8]) -> Option<Vec<u8>> {
         None
     }
 }
-
-// ---------------------------------------------------------------------------
-// HapSession
-// ---------------------------------------------------------------------------
 
 /// Pair-setup and pair-verify session for AirPlay 2 (transient, no persistent long-term keys).
 pub struct HapSession {
@@ -475,10 +444,6 @@ impl HapSession {
     pub fn shared_key(&self) -> Option<&[u8]> {
         self.shared_key.as_deref()
     }
-
-    // ------------------------------------------------------------------
-    // Pair-setup (SRP transient flow)
-    // ------------------------------------------------------------------
 
     /// Process a pair-setup request body (TLV8) and return a TLV8 response.
     pub fn pair_setup(&mut self, body: &[u8]) -> Vec<u8> {
@@ -524,10 +489,6 @@ impl HapSession {
         }
     }
 
-    // ------------------------------------------------------------------
-    // Pair-verify (X25519 + Ed25519)
-    // ------------------------------------------------------------------
-
     /// Process a pair-verify request body (TLV8) and return a TLV8 response.
     pub fn pair_verify(&mut self, body: &[u8]) -> Vec<u8> {
         let tlv_in = tlv::decode(body);
@@ -538,11 +499,9 @@ impl HapSession {
             0x01 => {
                 let client_pub_bytes = tlv_in.get(&tag::PUBLICKEY).cloned().unwrap_or_default();
 
-                // Generate our ephemeral X25519 keypair
                 let secret = EphemeralSecret::random_from_rng(rand::thread_rng());
                 let our_pub = X25519PublicKey::from(&secret);
 
-                // Compute shared secret
                 let client_pub_arr: [u8; 32] = match client_pub_bytes.as_slice().try_into() {
                     Ok(a) => a,
                     Err(_) => {
@@ -553,24 +512,20 @@ impl HapSession {
                 let shared = secret.diffie_hellman(&client_pub);
                 let shared_bytes = shared.as_bytes().clone();
 
-                // Derive session key via HKDF-SHA-256
                 let prk = hkdf_extract_sha256(b"Pair-Verify-Encrypt-Salt", &shared_bytes);
                 let session_key_vec =
                     hkdf_expand_sha256(&prk, b"Pair-Verify-Encrypt-Info", 32);
                 let mut session_key = [0u8; 32];
                 session_key.copy_from_slice(&session_key_vec);
 
-                // Build info = our_pub || identifier || client_pub
                 let mut info = Vec::new();
                 info.extend_from_slice(our_pub.as_bytes());
                 info.extend_from_slice(&self.identifier);
                 info.extend_from_slice(&client_pub_bytes);
 
-                // Sign info with our Ed25519 long-term key
                 use ed25519_dalek::Signer;
                 let signature = self.ltsk.sign(&info);
 
-                // Encrypt (identifier || signature) with session key, nonce counter=0
                 let mut sub_tlv_plain = Vec::new();
                 sub_tlv_plain.extend_from_slice(&tlv::encode(&[
                     (tag::IDENTIFIER, &self.identifier),
@@ -578,7 +533,6 @@ impl HapSession {
                 ]));
                 let encrypted_data = cc_encrypt(&session_key, b"PV-Msg02", &sub_tlv_plain);
 
-                // Save state for M3
                 self.verify_shared = Some(shared_bytes);
                 // Reuse verify_our_pub slot to store session key (via a small hack)
                 self.verify_our_pub = Some(our_pub);
@@ -609,10 +563,8 @@ impl HapSession {
                         return tlv::encode(&[(tag::STATE, &[0x04]), (tag::ERROR, &[0x06])])
                     }
                 };
-                // We simply accept any decryptable message (transient pairing)
                 let _ = tlv::decode(&plain);
 
-                // Activate encryption using the X25519 shared secret
                 let shared = match self.verify_shared.take() {
                     Some(s) => s,
                     None => {
@@ -628,10 +580,6 @@ impl HapSession {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// HapCodec - encrypted framing for the control channel
-// ---------------------------------------------------------------------------
 
 /// Derive the two 32-byte ChaCha20-Poly1305 keys from the HAP shared secret.
 /// Uses HKDF-SHA-512 (extract then single-block expand).

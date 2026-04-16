@@ -103,13 +103,11 @@ pub async fn capture(opts: CaptureOptions) -> anyhow::Result<String> {
     let (url_tx, mut url_rx) = watch::channel::<Option<String>>(None);
     let url_tx = Arc::new(url_tx);
 
-    // Stop signal: dropping stop_tx signals all receivers to shut down.
     let (stop_tx, stop_rx) = watch::channel(());
 
     let mut started: Vec<Protocol> = Vec::new();
     let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
-    // ── DLNA ───────────────────────────────────────────────────
     if opts.protocols.contains(&Protocol::Dlna) {
         let port = opts.port;
         let location = format!("http://{}:{}/device.xml", local_ip, port);
@@ -142,7 +140,6 @@ pub async fn capture(opts: CaptureOptions) -> anyhow::Result<String> {
         eprintln!("  📺 DLNA    \"{}\" on {}:{}", opts.name, local_ip, port);
     }
 
-    // ── AirPlay ────────────────────────────────────────────────
     if opts.protocols.contains(&Protocol::AirPlay) {
         let airplay_port = if opts.protocols.contains(&Protocol::Dlna) {
             opts.port + 1
@@ -169,7 +166,6 @@ pub async fn capture(opts: CaptureOptions) -> anyhow::Result<String> {
         eprintln!("  🍎 AirPlay \"{}\" on {}:{}", opts.name, local_ip, airplay_port);
     }
 
-    // ── Google Cast ────────────────────────────────────────────
     if opts.protocols.contains(&Protocol::Cast) {
         let cast_port: u16 = 8009;
         let recv = cast::CastReceiver::new(
@@ -197,7 +193,6 @@ pub async fn capture(opts: CaptureOptions) -> anyhow::Result<String> {
     eprintln!("\n  Protocols: {}", enabled.join(", "));
     eprintln!("  Open your app > cast > select \"{}\"\n", opts.name);
 
-    // Wait for URL capture
     let result = loop {
         url_rx.changed().await?;
         if let Some(url) = url_rx.borrow().clone() {
@@ -205,10 +200,7 @@ pub async fn capture(opts: CaptureOptions) -> anyhow::Result<String> {
         }
     };
 
-    // Signal all receivers to stop
     drop(stop_tx);
-
-    // Give tasks a moment to clean up
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     for h in handles {
         h.abort();

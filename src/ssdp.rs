@@ -40,7 +40,6 @@ impl SsdpAdvertiser {
     /// Run the SSDP advertiser until `cancel` is closed (sender dropped or
     /// an explicit value is sent).  Intended to be spawned with `tokio::spawn`.
     pub async fn run(self, mut cancel: tokio::sync::watch::Receiver<()>) -> anyhow::Result<()> {
-        // --- socket setup via socket2 so we can set SO_REUSEPORT / join multicast ---
         let local_ip: Ipv4Addr = self
             .local_ip
             .parse()
@@ -59,27 +58,21 @@ impl SsdpAdvertiser {
         raw.set_multicast_if_v4(&local_ip)
             .context("IP_MULTICAST_IF")?;
 
-        // Wrap into tokio UdpSocket
         let sock = UdpSocket::from_std(raw.into()).context("UdpSocket::from_std")?;
 
         let mut buf = vec![0u8; 4096];
-
-        // Send initial NOTIFY burst
         self.notify(&sock).await;
 
         loop {
             tokio::select! {
-                // Cancelled – send ssdp:byebye and exit
                 _ = cancel.changed() => {
                     self.byebye(&sock).await;
                     break;
                 }
 
-                // Receive with a 2-second timeout so we can re-announce
                 result = tokio::time::timeout(Duration::from_secs(2), sock.recv_from(&mut buf)) => {
                     match result {
                         Err(_) => {
-                            // Timeout – re-announce
                             self.notify(&sock).await;
                         }
                         Ok(Ok((len, addr))) => {

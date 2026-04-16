@@ -17,8 +17,6 @@ use tokio::net::TcpListener;
 use tokio::sync::{watch, Mutex};
 use tracing::{debug, info, warn};
 
-// ─── helpers ──────────────────────────────────────────────────────────────────
-
 fn html_unescape(s: &str) -> String {
     html_escape::decode_html_entities(s).into_owned()
 }
@@ -64,8 +62,6 @@ fn xml_response(status: StatusCode, body: impl Into<Bytes>) -> Response<Full<Byt
         .unwrap()
 }
 
-// ─── NOTIFY sender ────────────────────────────────────────────────────────────
-
 const NOTIFY_BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0">
   <e:property>
@@ -76,7 +72,6 @@ const NOTIFY_BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 /// Send a UPnP NOTIFY event to a single callback URL using a raw TCP write.
 /// The callback URL looks like `http://192.168.1.x:PORT/path`.
 async fn send_notify(callback_url: &str, sid: &str) {
-    // Parse the callback URL manually – we only need host, port, path.
     let url = callback_url
         .trim_start_matches("http://")
         .trim_start_matches("https://");
@@ -143,8 +138,6 @@ async fn notify_all(subscribers: &Arc<Mutex<HashMap<String, String>>>) {
     }
 }
 
-// ─── server state ─────────────────────────────────────────────────────────────
-
 pub struct UpnpServer {
     device_uuid: String,
     friendly_name: String,
@@ -173,7 +166,6 @@ impl UpnpServer {
         let listener = TcpListener::bind(addr).await?;
         info!("UPnP HTTP server listening on {addr}");
 
-        // Shared state
         let subscribers: Arc<Mutex<HashMap<String, String>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let captured: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
@@ -219,8 +211,6 @@ impl UpnpServer {
     }
 }
 
-// ─── request handler ──────────────────────────────────────────────────────────
-
 async fn handle_request(
     req: Request<Incoming>,
     server: Arc<UpnpServer>,
@@ -249,8 +239,6 @@ async fn handle_request(
     Ok(response)
 }
 
-// ─── GET ──────────────────────────────────────────────────────────────────────
-
 fn handle_get(path: &str, server: &UpnpServer) -> Response<Full<Bytes>> {
     match path {
         "/device.xml" => {
@@ -270,8 +258,6 @@ fn handle_get(path: &str, server: &UpnpServer) -> Response<Full<Bytes>> {
     }
 }
 
-// ─── POST / SOAP ──────────────────────────────────────────────────────────────
-
 async fn handle_post(
     req: Request<Incoming>,
     path: &str,
@@ -279,7 +265,6 @@ async fn handle_post(
     subscribers: &Arc<Mutex<HashMap<String, String>>>,
     captured: &Arc<AtomicBool>,
 ) -> Response<Full<Bytes>> {
-    // Determine service from path
     let service = if path.contains("AVTransport") {
         "AVTransport"
     } else if path.contains("RenderingControl") {
@@ -290,7 +275,6 @@ async fn handle_post(
         return text_response(StatusCode::NOT_FOUND, "Not Found");
     };
 
-    // Extract SOAPAction header
     let soap_action = req
         .headers()
         .get("soapaction")
@@ -302,7 +286,6 @@ async fn handle_post(
 
     debug!("SOAP action: {soap_action} on {service}");
 
-    // Read body
     use http_body_util::BodyExt;
     let body_bytes = match req.into_body().collect().await {
         Ok(b) => b.to_bytes(),
@@ -312,18 +295,15 @@ async fn handle_post(
 
     match soap_action.as_str() {
         "SetAVTransportURI" => {
-            // Extract URL from body
             let raw_url = extract_tag(&body_str, "CurrentURI")
                 .map(html_unescape)
                 .unwrap_or_default();
 
             info!("SetAVTransportURI: captured URL = {raw_url}");
 
-            // Mark as captured and send URL
             captured.store(true, Ordering::SeqCst);
             let _ = server.url_tx.send(Some(raw_url));
 
-            // After 3 s, notify all subscribers with STOPPED state
             let subs_clone = Arc::clone(subscribers);
             tokio::spawn(async move {
                 tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
@@ -407,14 +387,11 @@ async fn handle_post(
     }
 }
 
-// ─── SUBSCRIBE ────────────────────────────────────────────────────────────────
-
 async fn handle_subscribe(
     req: Request<Incoming>,
     path: &str,
     subscribers: &Arc<Mutex<HashMap<String, String>>>,
 ) -> Response<Full<Bytes>> {
-    // CALLBACK header: <http://192.168.1.x:PORT/path>
     let callback_raw = req
         .headers()
         .get("callback")
@@ -423,7 +400,6 @@ async fn handle_subscribe(
         .unwrap_or("")
         .to_owned();
 
-    // Extract URL from angle brackets
     let callback_url = callback_raw
         .trim()
         .trim_start_matches('<')
@@ -458,8 +434,6 @@ async fn handle_subscribe(
         .body(Full::new(Bytes::new()))
         .unwrap()
 }
-
-// ─── UNSUBSCRIBE ──────────────────────────────────────────────────────────────
 
 async fn handle_unsubscribe(
     req: Request<Incoming>,

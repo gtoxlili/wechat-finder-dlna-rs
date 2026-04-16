@@ -17,22 +17,18 @@ pub fn get_lan_ip() -> Result<String> {
 
             let octets = ip.octets();
 
-            // Skip loopback
             if octets[0] == 127 {
                 continue;
             }
 
-            // 192.168.x.x
             if octets[0] == 192 && octets[1] == 168 {
                 return Ok(ip.to_string());
             }
 
-            // 10.x.x.x
             if octets[0] == 10 {
                 return Ok(ip.to_string());
             }
 
-            // 172.16.x.x – 172.31.x.x
             if octets[0] == 172 && (16..=31).contains(&octets[1]) {
                 return Ok(ip.to_string());
             }
