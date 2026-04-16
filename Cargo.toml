@@ -1,0 +1,68 @@
+[package]
+name = "wechat-finder-dlna"
+version = "0.3.0"
+edition = "2024"
+description = "Capture WeChat Video Channel live streams via fake screen casting (DLNA / AirPlay / Chromecast)"
+license = "GPL-3.0-or-later"
+authors = ["gtoxlili"]
+
+[lib]
+name = "wechat_finder_dlna"
+path = "src/lib.rs"
+
+[[bin]]
+name = "wechat-finder-dlna"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP server
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+http = "1"
+
+# TLS
+tokio-rustls = "0.26"
+rustls = { version = "0.23", features = ["ring"] }
+rcgen = "0.13"
+
+# mDNS
+mdns-sd = "0.12"
+
+# Crypto
+chacha20poly1305 = "0.10"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+hmac = "0.12"
+sha2 = "0.10"
+rand = "0.8"
+num-bigint = "0.4"
+num-traits = "0.2"
+num-integer = "0.1"
+
+# Plist
+plist = "1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Encoding
+hex = "0.4"
+html-escape = "0.2"
+
+# Misc
+regex = "1"
+uuid = { version = "1", features = ["v4"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+bytes = "1"
+anyhow = "1"
+socket2 = "0.5"
+network-interface = "2"
+which = "7"
+

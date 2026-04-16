@@ -1,0 +1,9 @@
+# Optimized for Apple Silicon (M4 Pro / aarch64-apple-darwin)
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "target-cpu=apple-m4"]
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
+opt-level = 3
