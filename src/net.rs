@@ -66,3 +66,28 @@ pub fn get_lan_ip() -> Result<String> {
         .context("failed to get local address from UDP socket")?;
     Ok(addr.ip().to_string())
 }
+
+/// Resolve a bind target to an IP address.
+/// Accepts either an IP address ("192.168.1.100") or an interface name ("en1").
+pub fn resolve_bind(val: &str) -> Result<String> {
+    // If it parses as an IP, use directly.
+    if val.parse::<std::net::Ipv4Addr>().is_ok() {
+        return Ok(val.to_string());
+    }
+
+    // Otherwise treat as interface name.
+    let interfaces =
+        NetworkInterface::show().context("failed to enumerate network interfaces")?;
+    for iface in &interfaces {
+        if iface.name == val {
+            for addr in &iface.addr {
+                if let Addr::V4(v4) = addr {
+                    if !v4.ip.is_loopback() {
+                        return Ok(v4.ip.to_string());
+                    }
+                }
+            }
+        }
+    }
+    anyhow::bail!("no IPv4 address found for interface '{val}'")
+}

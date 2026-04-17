@@ -36,9 +36,9 @@ struct Cli {
     #[arg(long, value_name = "HH:MM:SS")]
     duration: Option<String>,
 
-    /// Bind to a specific LAN IP instead of auto-detecting.
-    #[arg(long, value_name = "IP")]
-    bind_ip: Option<String>,
+    /// Bind to a specific interface (e.g. "en1") or IP address.
+    #[arg(long, value_name = "IFACE_OR_IP")]
+    bind: Option<String>,
 
     /// Debug logging.
     #[arg(short, long)]
@@ -88,7 +88,7 @@ async fn main() {
         name: cli.name,
         port: cli.port,
         protocols,
-        bind_ip: cli.bind_ip,
+        bind: cli.bind,
         audio_output: cli.record.clone(),
         audio_duration: audio_dur,
     };

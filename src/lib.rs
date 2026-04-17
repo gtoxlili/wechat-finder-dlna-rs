@@ -75,8 +75,9 @@ pub struct CaptureOptions {
     pub port: u16,
     /// Which protocols to enable. Defaults to all.
     pub protocols: Vec<Protocol>,
-    /// Override the LAN IP to bind to. If None, auto-detected via [`net::get_lan_ip`].
-    pub bind_ip: Option<String>,
+    /// Bind to a specific network interface (e.g. "en1") or IP address.
+    /// If None, auto-detected via [`net::get_lan_ip`].
+    pub bind: Option<String>,
     /// Optional path for AirPlay audio recording.
     pub audio_output: Option<String>,
     /// Optional recording duration in seconds.
@@ -89,7 +90,7 @@ impl Default for CaptureOptions {
             name: "MAGI".into(),
             port: 9090,
             protocols: Protocol::ALL.to_vec(),
-            bind_ip: None,
+            bind: None,
             audio_output: None,
             audio_duration: None,
         }
@@ -100,8 +101,8 @@ impl Default for CaptureOptions {
 ///
 /// Returns the captured stream/video URL.
 pub async fn capture(opts: CaptureOptions) -> anyhow::Result<String> {
-    let local_ip = match opts.bind_ip {
-        Some(ref ip) => ip.clone(),
+    let local_ip = match opts.bind {
+        Some(ref val) => net::resolve_bind(val)?,
         None => net::get_lan_ip()?,
     };
     let dev_uuid = format!("uuid:{}", uuid::Uuid::new_v4());
