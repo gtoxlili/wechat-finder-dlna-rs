@@ -1,6 +1,6 @@
 [package]
 name = "wechat-finder-dlna"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2024"
 description = "Intercept cast stream URLs by impersonating a smart TV — supports DLNA, AirPlay 2, and Chromecast simultaneously"
 license = "GPL-3.0-or-later"
