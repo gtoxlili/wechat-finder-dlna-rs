@@ -24,10 +24,29 @@ fn html_unescape(s: &str) -> String {
 /// Extract the text content of the first `<tag ...>…</tag>`.
 /// Handles tags with or without attributes (e.g. `<CurrentURI xmlns="...">`)
 /// to match the Python regex `<CurrentURI[^>]*>(.*?)</CurrentURI>`.
+///
+/// A naïve `body.find("<CurrentURI")` would also match `<CurrentURIMetaData`
+/// as a prefix; SOAP arguments can appear in any order, so if
+/// CurrentURIMetaData precedes CurrentURI in the payload we'd end up
+/// parsing the metadata blob as the URL. Scan for the literal prefix
+/// and confirm the character immediately after is `>` or whitespace,
+/// which only matches the real tag open.
 fn extract_tag<'a>(body: &'a str, tag: &str) -> Option<&'a str> {
     let open_prefix = format!("<{tag}");
     let close = format!("</{tag}>");
-    let tag_start = body.find(&open_prefix)?;
+
+    let bytes = body.as_bytes();
+    let mut search_from = 0;
+    let tag_start = loop {
+        let rel = body[search_from..].find(&open_prefix)?;
+        let abs = search_from + rel;
+        match bytes.get(abs + open_prefix.len()) {
+            Some(b'>') | Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r')
+            | Some(b'/') => break abs,
+            _ => search_from = abs + open_prefix.len(),
+        }
+    };
+
     let after_tag = &body[tag_start + open_prefix.len()..];
     // Find the closing '>' of the opening tag
     let gt = after_tag.find('>')?;
@@ -65,13 +84,21 @@ fn xml_response(status: StatusCode, body: impl Into<Bytes>) -> Response<Full<Byt
 const NOTIFY_BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0">
   <e:property>
-    <LastChange>&lt;Event xmlns=&quot;urn:schemas-upnp-org:metadata-1-0/AVT/&quot;&gt;&lt;InstanceID val=&quot;0&quot;&gt;&lt;TransportState val=&quot;STOPPED&quot;/&gt;&lt;/InstanceID&gt;&lt;/Event&gt;</LastChange>
+    <LastChange>&lt;Event xmlns=&quot;urn:schemas-upnp-org:metadata-1-0/AVT/&quot;&gt;&lt;InstanceID val=&quot;0&quot;&gt;&lt;TransportState val=&quot;PLAYING&quot;/&gt;&lt;/InstanceID&gt;&lt;/Event&gt;</LastChange>
   </e:property>
 </e:propertyset>"#;
 
 /// Send a UPnP NOTIFY event to a single callback URL using a raw TCP write.
 /// The callback URL looks like `http://192.168.1.x:PORT/path`.
 async fn send_notify(callback_url: &str, sid: &str) {
+    use std::time::Duration;
+
+    // Bound the entire exchange — a subscriber that ignored UNSUBSCRIBE
+    // or got partitioned will otherwise block this task for ~75s on
+    // OS-level TCP timeout, delaying shutdown of the whole receiver.
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+    const WRITE_TIMEOUT: Duration = Duration::from_secs(3);
+
     let url = callback_url
         .trim_start_matches("http://")
         .trim_start_matches("https://");
@@ -97,10 +124,19 @@ async fn send_notify(callback_url: &str, sid: &str) {
     };
 
     let addr = format!("{host}:{port}");
-    let stream = match tokio::net::TcpStream::connect(&addr).await {
-        Ok(s) => s,
-        Err(e) => {
+    let mut stream = match tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        tokio::net::TcpStream::connect(&addr),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
             warn!("NOTIFY: connect to {addr} failed: {e}");
+            return;
+        }
+        Err(_) => {
+            warn!("NOTIFY: connect to {addr} timed out");
             return;
         }
     };
@@ -120,9 +156,10 @@ async fn send_notify(callback_url: &str, sid: &str) {
     );
 
     use tokio::io::AsyncWriteExt;
-    let mut stream = stream;
-    if let Err(e) = stream.write_all(request.as_bytes()).await {
-        warn!("NOTIFY: write to {addr} failed: {e}");
+    match tokio::time::timeout(WRITE_TIMEOUT, stream.write_all(request.as_bytes())).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!("NOTIFY: write to {addr} failed: {e}"),
+        Err(_) => warn!("NOTIFY: write to {addr} timed out"),
     }
 }
 
@@ -139,9 +176,11 @@ async fn notify_all(subscribers: &Arc<Mutex<HashMap<String, String>>>) {
 }
 
 pub struct UpnpServer {
-    device_uuid: String,
-    friendly_name: String,
     url_tx: watch::Sender<Option<String>>,
+    /// Pre-rendered device.xml — friendly_name and uuid are immutable
+    /// for the lifetime of the server, so we format! once and clone
+    /// Bytes on each GET instead of re-rendering per request.
+    device_xml: Bytes,
 }
 
 impl UpnpServer {
@@ -150,11 +189,8 @@ impl UpnpServer {
         friendly_name: String,
         url_tx: watch::Sender<Option<String>>,
     ) -> Self {
-        Self {
-            device_uuid,
-            friendly_name,
-            url_tx,
-        }
+        let device_xml = Bytes::from(descriptors::device_xml(&friendly_name, &device_uuid));
+        Self { url_tx, device_xml }
     }
 
     pub async fn run(
@@ -241,18 +277,17 @@ async fn handle_request(
 
 fn handle_get(path: &str, server: &UpnpServer) -> Response<Full<Bytes>> {
     match path {
-        "/device.xml" => {
-            let xml = descriptors::device_xml(&server.friendly_name, &server.device_uuid);
-            xml_response(StatusCode::OK, xml)
-        }
+        "/device.xml" => xml_response(StatusCode::OK, server.device_xml.clone()),
+        // SCPDs are static for the lifetime of the binary — serve directly
+        // from their &'static str without copying into a heap Bytes.
         "/AVTransport/scpd.xml" => {
-            xml_response(StatusCode::OK, descriptors::AVTRANSPORT_SCPD)
+            xml_response(StatusCode::OK, Bytes::from_static(descriptors::AVTRANSPORT_SCPD.as_bytes()))
         }
         "/RenderingControl/scpd.xml" => {
-            xml_response(StatusCode::OK, descriptors::RENDERING_SCPD)
+            xml_response(StatusCode::OK, Bytes::from_static(descriptors::RENDERING_SCPD.as_bytes()))
         }
         "/ConnectionManager/scpd.xml" => {
-            xml_response(StatusCode::OK, descriptors::CONNMGR_SCPD)
+            xml_response(StatusCode::OK, Bytes::from_static(descriptors::CONNMGR_SCPD.as_bytes()))
         }
         _ => text_response(StatusCode::NOT_FOUND, "Not Found"),
     }
@@ -294,31 +329,44 @@ async fn handle_post(
     let body_str = String::from_utf8_lossy(&body_bytes).into_owned();
 
     match soap_action.as_str() {
-        "SetAVTransportURI" => {
+        "SetAVTransportURI" | "SetNextAVTransportURI" => {
             let raw_url = extract_tag(&body_str, "CurrentURI")
+                .or_else(|| extract_tag(&body_str, "NextURI"))
                 .map(html_unescape)
                 .unwrap_or_default();
 
-            info!("SetAVTransportURI: captured URL = {raw_url}");
+            if !raw_url.is_empty() {
+                info!("{soap_action}: captured URL = {raw_url}");
+                captured.store(true, Ordering::SeqCst);
+                let _ = server.url_tx.send(Some(raw_url));
 
-            captured.store(true, Ordering::SeqCst);
-            let _ = server.url_tx.send(Some(raw_url));
+                // Push a TransportState=PLAYING NOTIFY to any subscribed
+                // control point so UIs driven by eventing (rather than
+                // polling) move to "playing" alongside the ones that
+                // poll GetTransportInfo. Fire promptly (not after 3s)
+                // because the capture-linger window is bounded.
+                let subs_clone = Arc::clone(subscribers);
+                tokio::spawn(async move {
+                    notify_all(&subs_clone).await;
+                });
+            }
 
-            let subs_clone = Arc::clone(subscribers);
-            tokio::spawn(async move {
-                tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-                notify_all(&subs_clone).await;
-            });
-
-            let xml = descriptors::soap_response("SetAVTransportURI", service, "");
+            let xml = descriptors::soap_response(&soap_action, service, "");
             xml_response(StatusCode::OK, xml)
         }
 
         "GetTransportInfo" => {
+            // Before SetAVTransportURI → NO_MEDIA_PRESENT so senders
+            // don't skip the Play step (they typically gate Play on
+            // state ∈ {STOPPED, NO_MEDIA_PRESENT}). After capture →
+            // PLAYING so the sender's casting UI stays stable during
+            // the post-capture linger. Reporting STOPPED here would
+            // cue the user's phone to show "cast failed" and tempt
+            // retaps.
             let state = if captured.load(Ordering::SeqCst) {
-                "STOPPED"
-            } else {
                 "PLAYING"
+            } else {
+                "NO_MEDIA_PRESENT"
             };
             let body = format!(
                 "<CurrentTransportState>{state}</CurrentTransportState>\
@@ -342,14 +390,68 @@ async fn handle_post(
             xml_response(StatusCode::OK, xml)
         }
 
+        "GetMediaInfo" => {
+            let body = "<NrTracks>0</NrTracks>\
+                        <MediaDuration>00:00:00</MediaDuration>\
+                        <CurrentURI/>\
+                        <CurrentURIMetaData/>\
+                        <NextURI/>\
+                        <NextURIMetaData/>\
+                        <PlayMedium>NETWORK</PlayMedium>\
+                        <RecordMedium>NOT_IMPLEMENTED</RecordMedium>\
+                        <WriteStatus>NOT_IMPLEMENTED</WriteStatus>";
+            let xml = descriptors::soap_response("GetMediaInfo", service, body);
+            xml_response(StatusCode::OK, xml)
+        }
+
+        "GetDeviceCapabilities" => {
+            let body = "<PlayMedia>NETWORK,HDD</PlayMedia>\
+                        <RecMedia>NOT_IMPLEMENTED</RecMedia>\
+                        <RecQualityModes>NOT_IMPLEMENTED</RecQualityModes>";
+            let xml = descriptors::soap_response("GetDeviceCapabilities", service, body);
+            xml_response(StatusCode::OK, xml)
+        }
+
+        "GetTransportSettings" => {
+            let body = "<PlayMode>NORMAL</PlayMode>\
+                        <RecQualityMode>NOT_IMPLEMENTED</RecQualityMode>";
+            let xml = descriptors::soap_response("GetTransportSettings", service, body);
+            xml_response(StatusCode::OK, xml)
+        }
+
         "GetVolume" => {
             let body = "<CurrentVolume>50</CurrentVolume>";
             let xml = descriptors::soap_response("GetVolume", service, body);
             xml_response(StatusCode::OK, xml)
         }
 
+        "GetMute" => {
+            let body = "<CurrentMute>0</CurrentMute>";
+            let xml = descriptors::soap_response("GetMute", service, body);
+            xml_response(StatusCode::OK, xml)
+        }
+
+        "GetCurrentConnectionIDs" => {
+            let body = "<ConnectionIDs>0</ConnectionIDs>";
+            let xml = descriptors::soap_response("GetCurrentConnectionIDs", service, body);
+            xml_response(StatusCode::OK, xml)
+        }
+
+        "GetCurrentConnectionInfo" => {
+            let body = "<RcsID>0</RcsID>\
+                        <AVTransportID>0</AVTransportID>\
+                        <ProtocolInfo></ProtocolInfo>\
+                        <PeerConnectionManager></PeerConnectionManager>\
+                        <PeerConnectionID>-1</PeerConnectionID>\
+                        <Direction>Input</Direction>\
+                        <Status>OK</Status>";
+            let xml = descriptors::soap_response("GetCurrentConnectionInfo", service, body);
+            xml_response(StatusCode::OK, xml)
+        }
+
         "GetProtocolInfo" => {
-            let body = "<Source/><Sink>\
+            let body = "<Source></Source>\
+                        <Sink>\
                         http-get:*:video/mp4:*,\
                         http-get:*:video/x-matroska:*,\
                         http-get:*:video/x-msvideo:*,\
@@ -373,14 +475,17 @@ async fn handle_post(
             xml_response(StatusCode::OK, xml)
         }
 
-        "Play" | "Stop" | "Pause" => {
+        "Play" | "Stop" | "Pause" | "Next" | "Previous" | "Seek"
+        | "SetPlayMode" | "SetVolume" | "SetMute" => {
             let xml = descriptors::soap_response(&soap_action, service, "");
             xml_response(StatusCode::OK, xml)
         }
 
         _ => {
-            // Python always returns 200 for any SOAP action, even unknown ones.
-            // Some DLNA clients send proprietary actions and expect 200 OK.
+            // Generic 200 OK with empty response envelope. Some Chinese
+            // controllers (Tencent/iQiyi/MiBox) send vendor extensions
+            // that a strict renderer would 500 on, but a permissive 200
+            // keeps the casting flow alive.
             let xml = descriptors::soap_response(&soap_action, service, "");
             xml_response(StatusCode::OK, xml)
         }
@@ -458,4 +563,85 @@ async fn handle_unsubscribe(
         .status(StatusCode::OK)
         .body(Full::new(Bytes::new()))
         .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const WECHAT_SOAP_BODY: &str = r#"<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+ <s:Body>
+  <u:SetAVTransportURI xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">
+   <InstanceID>0</InstanceID>
+   <CurrentURI>http://example.com/live.m3u8?token=abc</CurrentURI>
+   <CurrentURIMetaData>&lt;DIDL-Lite...&gt;</CurrentURIMetaData>
+  </u:SetAVTransportURI>
+ </s:Body>
+</s:Envelope>"#;
+
+    /// Real-world-ish payload where the metadata tag appears BEFORE the
+    /// URI. Some iQiyi/QQ SOAP builders emit fields in arbitrary order.
+    const REVERSED_SOAP_BODY: &str = r#"<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+ <s:Body>
+  <u:SetAVTransportURI xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">
+   <InstanceID>0</InstanceID>
+   <CurrentURIMetaData>&lt;DIDL-Lite...&gt;</CurrentURIMetaData>
+   <CurrentURI>http://example.com/reversed.mp4</CurrentURI>
+  </u:SetAVTransportURI>
+ </s:Body>
+</s:Envelope>"#;
+
+    #[test]
+    fn extract_tag_ordered() {
+        assert_eq!(
+            extract_tag(WECHAT_SOAP_BODY, "CurrentURI"),
+            Some("http://example.com/live.m3u8?token=abc")
+        );
+    }
+
+    #[test]
+    fn extract_tag_reversed_order() {
+        // Before the prefix-match fix, this would return a truncated
+        // snippet of the CurrentURIMetaData body because `<CurrentURI`
+        // is a prefix of `<CurrentURIMetaData`.
+        assert_eq!(
+            extract_tag(REVERSED_SOAP_BODY, "CurrentURI"),
+            Some("http://example.com/reversed.mp4")
+        );
+    }
+
+    #[test]
+    fn extract_tag_with_attributes() {
+        let body = r#"<root><CurrentURI xmlns="urn:foo">http://x/y</CurrentURI></root>"#;
+        assert_eq!(extract_tag(body, "CurrentURI"), Some("http://x/y"));
+    }
+
+    #[test]
+    fn extract_tag_self_closing_not_treated_as_container() {
+        // Self-closing tag <CurrentURI/> has no inner content; the
+        // parser should return None rather than a random slice.
+        let body = r#"<root><CurrentURI/></root>"#;
+        assert_eq!(extract_tag(body, "CurrentURI"), None);
+    }
+
+    #[test]
+    fn extract_tag_missing_returns_none() {
+        let body = r#"<root><SomeOtherField>x</SomeOtherField></root>"#;
+        assert_eq!(extract_tag(body, "CurrentURI"), None);
+    }
+
+    #[test]
+    fn soap_action_name_strips_service_prefix() {
+        assert_eq!(
+            soap_action_name("\"urn:schemas-upnp-org:service:AVTransport:1#Play\""),
+            "Play"
+        );
+        assert_eq!(
+            soap_action_name("urn:schemas-upnp-org:service:AVTransport:1#SetAVTransportURI"),
+            "SetAVTransportURI"
+        );
+        assert_eq!(soap_action_name(""), "");
+    }
 }
