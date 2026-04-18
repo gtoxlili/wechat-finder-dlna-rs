@@ -6,7 +6,10 @@ use std::net::UdpSocket;
 /// Skips VPN (utun/tun), Tailscale, Docker (veth/br), etc.
 const PHYSICAL_PREFIXES: &[&str] = &["en", "eth", "wlan"];
 
-fn is_physical(name: &str) -> bool {
+/// True when the interface name looks like a real Ethernet/WiFi adapter.
+/// Exposed so other modules (AirPlay device-id derivation, Cast mDNS)
+/// can apply the same filter and avoid exposing VPN/Docker MACs.
+pub fn is_physical(name: &str) -> bool {
     let lower = name.to_lowercase();
     PHYSICAL_PREFIXES.iter().any(|p| lower.starts_with(p))
 }
@@ -79,15 +82,60 @@ pub fn resolve_bind(val: &str) -> Result<String> {
     let interfaces =
         NetworkInterface::show().context("failed to enumerate network interfaces")?;
     for iface in &interfaces {
-        if iface.name == val {
-            for addr in &iface.addr {
-                if let Addr::V4(v4) = addr {
-                    if !v4.ip.is_loopback() {
-                        return Ok(v4.ip.to_string());
+        if iface.name != val {
+            continue;
+        }
+        for addr in &iface.addr {
+            if let Addr::V4(v4) = addr
+                && !v4.ip.is_loopback()
+            {
+                return Ok(v4.ip.to_string());
+            }
+        }
+    }
+    anyhow::bail!("no IPv4 address found for interface '{val}'")
+}
+
+/// Enumerate every physical IPv4 address with a private range.
+///
+/// Used when the user hasn't specified a `bind` — we want to advertise
+/// SSDP on every subnet the host is reachable on, so controllers on
+/// wifi, wired ethernet, and thunderbolt bridges all see the device.
+/// Skips loopback, link-local (169.254.x.x), VPN (utun/tun),
+/// Docker/K8s bridges (docker/br-/veth/cni), and Tailscale (tailscale0).
+pub fn all_lan_ipv4() -> Result<Vec<String>> {
+    let interfaces =
+        NetworkInterface::show().context("failed to enumerate network interfaces")?;
+
+    let mut out = Vec::new();
+    for iface in &interfaces {
+        if !is_physical(&iface.name) {
+            continue;
+        }
+        for addr in &iface.addr {
+            if let Addr::V4(v4) = addr {
+                let octets = v4.ip.octets();
+                if v4.ip.is_loopback() {
+                    continue;
+                }
+                if octets[0] == 169 && octets[1] == 254 {
+                    continue;
+                }
+                if is_private(&octets) {
+                    let s = v4.ip.to_string();
+                    if !out.contains(&s) {
+                        out.push(s);
                     }
                 }
             }
         }
     }
-    anyhow::bail!("no IPv4 address found for interface '{val}'")
+
+    if out.is_empty() {
+        // Fall back to the single-IP detection path so callers always get
+        // at least one usable address.
+        out.push(get_lan_ip()?);
+    }
+
+    Ok(out)
 }
