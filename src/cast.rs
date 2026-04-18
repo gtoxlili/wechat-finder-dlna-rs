@@ -25,7 +25,26 @@ pub struct CastMessage {
 }
 
 impl CastMessage {
+    /// Rough upper-bound estimate of the encoded size. Each field has a
+    /// ~2-byte tag + varint length header; strings and bytes contribute
+    /// their length plus ~2 bytes of framing. Used to pre-allocate the
+    /// output Vec so encode() runs without resizing.
+    fn encoded_size_hint(&self) -> usize {
+        let mut n = 4; // protocol_version + payload_type
+        n += 2 + self.source_id.len();
+        n += 2 + self.destination_id.len();
+        n += 2 + self.namespace.len();
+        if let Some(ref s) = self.payload_utf8 {
+            n += 4 + s.len();
+        }
+        if let Some(ref b) = self.payload_binary {
+            n += 4 + b.len();
+        }
+        n
+    }
+
     pub fn encode(&self, buf: &mut Vec<u8>) {
+        buf.reserve(self.encoded_size_hint());
         // Protobuf wire encoding (matching the .proto field numbers)
         // field 1: protocol_version (varint)
         encode_varint_field(buf, 1, self.protocol_version as u64);
@@ -61,9 +80,21 @@ impl CastMessage {
                 (5, 0) => { let (v, p) = decode_varint(data, pos)?; msg.payload_type = v as i32; pos = p; }
                 (6, 2) => { let (v, p) = decode_bytes(data, pos)?; msg.payload_utf8 = Some(String::from_utf8_lossy(v).into_owned()); pos = p; }
                 (7, 2) => { let (v, p) = decode_bytes(data, pos)?; msg.payload_binary = Some(v.to_vec()); pos = p; }
-                (_, 0) => { let (_, p) = decode_varint(data, pos)?; pos = p; } // skip unknown varint
-                (_, 2) => { let (_, p) = decode_bytes(data, pos)?; pos = p; } // skip unknown len-delimited
-                _ => { anyhow::bail!("unsupported wire type {wire_type} for tag {tag}"); }
+                // Skip unknown fields per protobuf forward-compat rules
+                // rather than bailing — a Cast V3 message with a new
+                // fixed64/fixed32 field would otherwise kill the whole
+                // connection, breaking us when Google extends the wire.
+                (_, 0) => { let (_, p) = decode_varint(data, pos)?; pos = p; }
+                (_, 1) => {
+                    anyhow::ensure!(pos + 8 <= data.len(), "fixed64 truncated");
+                    pos += 8;
+                }
+                (_, 2) => { let (_, p) = decode_bytes(data, pos)?; pos = p; }
+                (_, 5) => {
+                    anyhow::ensure!(pos + 4 <= data.len(), "fixed32 truncated");
+                    pos += 4;
+                }
+                _ => anyhow::bail!("unsupported wire type {wire_type} for tag {tag}"),
             }
         }
         Ok(msg)
@@ -80,7 +111,7 @@ fn encode_varint(buf: &mut Vec<u8>, mut val: u64) {
 }
 
 fn encode_varint_field(buf: &mut Vec<u8>, field: u32, val: u64) {
-    encode_varint(buf, ((field as u64) << 3) | 0); // wire type 0
+    encode_varint(buf, (field as u64) << 3); // wire type 0
     encode_varint(buf, val);
 }
 
@@ -177,7 +208,7 @@ impl CastReceiver {
         props.insert("nf".into(), "1".into());
         props.insert("rs".into(), String::new());
 
-        let service_name = format!("{}", device_id);
+        let service_name = device_id.clone();
         let service_info = ServiceInfo::new(
             "_googlecast._tcp.local.",
             &service_name,
@@ -233,6 +264,15 @@ impl CastReceiver {
 }
 
 fn build_tls_acceptor() -> Result<TlsAcceptor> {
+    // rustls 0.23 requires an explicit process-level CryptoProvider.
+    // The `ring` crate feature enables the ring provider but doesn't
+    // auto-install it as the default — without this, the first TLS
+    // accept panics with "Could not automatically determine the
+    // process-level CryptoProvider". Install once; subsequent calls
+    // are no-ops by design (install_default returns the existing one
+    // instead of panicking).
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let key_pair = KeyPair::generate().context("Failed to generate TLS key pair")?;
     let mut params = CertificateParams::default();
     params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -297,13 +337,28 @@ async fn handle_cast_connection(
 
         let responses = match msg.namespace.as_str() {
             NS_CONNECTION => {
-                let resp = build_message(
-                    "receiver-0",
-                    &msg.source_id,
-                    NS_CONNECTION,
-                    json!({"type": "CONNECTED"}),
-                );
-                vec![resp]
+                // CONNECT establishes the virtual channel; CLOSE tears it
+                // down. Previously we replied CONNECTED to *every*
+                // tp.connection message including CLOSE, confusing senders.
+                // Now only acknowledge CONNECT, and on CLOSE let the TCP
+                // side close naturally without pushing an unsolicited
+                // CONNECTED back.
+                match msg_type {
+                    "CONNECT" => {
+                        let resp = build_message(
+                            "receiver-0",
+                            &msg.source_id,
+                            NS_CONNECTION,
+                            json!({"type": "CONNECTED"}),
+                        );
+                        vec![resp]
+                    }
+                    "CLOSE" => {
+                        debug!("Cast: client closed virtual channel");
+                        vec![]
+                    }
+                    _ => vec![],
+                }
             }
             NS_HEARTBEAT => {
                 if msg_type == "PING" {
@@ -321,7 +376,7 @@ async fn handle_cast_connection(
             NS_RECEIVER => {
                 let request_id = payload.get("requestId").and_then(|v| v.as_i64()).unwrap_or(0);
                 match msg_type {
-                    "GET_STATUS" | "LAUNCH" => {
+                    "GET_STATUS" | "LAUNCH" | "STOP" => {
                         let resp = build_message(
                             "receiver-0",
                             &msg.source_id,
@@ -340,8 +395,37 @@ async fn handle_cast_connection(
                         let url = extract_url_from_load(&payload);
                         if let Some(ref u) = url {
                             info!("Cast: received media URL: {}", u);
+                            if let Some(st) = payload
+                                .get("media")
+                                .and_then(|m| m.get("streamType"))
+                                .and_then(|v| v.as_str())
+                            {
+                                debug!("Cast: streamType = {st}");
+                            }
                             let _ = url_tx.send(Some(u.clone()));
                         }
+                        // Reply with BUFFERING → PLAYING so the sender thinks
+                        // the LOAD succeeded and its UI stays on "casting".
+                        // We deliberately do NOT close the connection here;
+                        // the outer capture() adds a post-capture linger so
+                        // the user sees a stable "playing on TV" state for
+                        // a few seconds before the process exits, avoiding
+                        // the UX trap where instant failure prompts retaps.
+                        let buf = build_message(
+                            "receiver-0",
+                            &msg.source_id,
+                            NS_MEDIA,
+                            media_status_payload(request_id, "BUFFERING", ""),
+                        );
+                        let play = build_message(
+                            "receiver-0",
+                            &msg.source_id,
+                            NS_MEDIA,
+                            media_status_payload(request_id, "PLAYING", ""),
+                        );
+                        vec![buf, play]
+                    }
+                    "GET_STATUS" => {
                         let resp = build_message(
                             "receiver-0",
                             &msg.source_id,
@@ -350,12 +434,17 @@ async fn handle_cast_connection(
                         );
                         vec![resp]
                     }
-                    "GET_STATUS" => {
+                    "PAUSE" | "PLAY" | "STOP" | "SEEK" | "SET_VOLUME"
+                    | "EDIT_TRACKS_INFO" | "QUEUE_LOAD" | "QUEUE_UPDATE" => {
+                        // Acknowledge media control commands — some senders
+                        // wait for a media status reply before tearing the
+                        // session down, which lets us capture the URL
+                        // before the TCP close.
                         let resp = build_message(
                             "receiver-0",
                             &msg.source_id,
                             NS_MEDIA,
-                            media_status_payload(request_id, "IDLE", "FINISHED"),
+                            media_status_payload(request_id, "PLAYING", ""),
                         );
                         vec![resp]
                     }
@@ -377,15 +466,14 @@ async fn handle_cast_connection(
 fn extract_url_from_load(payload: &Value) -> Option<String> {
     let media = payload.get("media")?;
 
-    if let Some(url) = media.get("contentUrl").and_then(|v| v.as_str()) {
-        if !url.is_empty() {
+    // Newer CAF senders (2022+) use contentUrl; legacy senders (including
+    // older WeChat builds) populate contentId with the actual URL;
+    // `entity` is rarer and used by some Cast-CAF reference apps.
+    for key in ["contentUrl", "contentId", "entity"] {
+        if let Some(url) = media.get(key).and_then(|v| v.as_str())
+            && !url.is_empty()
+        {
             return Some(url.to_string());
-        }
-    }
-
-    if let Some(id) = media.get("contentId").and_then(|v| v.as_str()) {
-        if !id.is_empty() {
-            return Some(id.to_string());
         }
     }
 
@@ -399,7 +487,12 @@ fn build_message(source: &str, destination: &str, namespace: &str, payload: Valu
         destination_id: destination.to_string(),
         namespace: namespace.to_string(),
         payload_type: 0, // STRING
-        payload_utf8: Some(serde_json::to_string(&payload).unwrap()),
+        // serde_json::to_string on a Value produced by json!() is
+        // infallible by construction — the value is always a valid
+        // JSON tree. expect() documents that assumption explicitly.
+        payload_utf8: Some(
+            serde_json::to_string(&payload).expect("json! macro produces serializable values"),
+        ),
         payload_binary: None,
     }
 }
@@ -408,11 +501,16 @@ async fn write_cast_message<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
     msg: &CastMessage,
 ) -> Result<()> {
-    let mut buf = Vec::new();
-    msg.encode(&mut buf);
-    let len = buf.len() as u32;
-    writer.write_all(&len.to_be_bytes()).await?;
-    writer.write_all(&buf).await?;
+    // Pack the 4-byte length prefix and the protobuf body into a single
+    // Vec so one write_all syscall delivers the whole frame. Avoids the
+    // interleaving risk of two separate writes under TLS and a flush
+    // between them.
+    let mut frame = Vec::with_capacity(4 + msg.encoded_size_hint());
+    frame.extend_from_slice(&[0, 0, 0, 0]); // placeholder for length
+    msg.encode(&mut frame);
+    let body_len = (frame.len() - 4) as u32;
+    frame[..4].copy_from_slice(&body_len.to_be_bytes());
+    writer.write_all(&frame).await?;
     writer.flush().await?;
     Ok(())
 }
@@ -445,23 +543,35 @@ fn receiver_status_payload(request_id: i64) -> Value {
 }
 
 fn media_status_payload(request_id: i64, player_state: &str, idle_reason: &str) -> Value {
+    // idleReason is only meaningful when playerState == IDLE. Emitting
+    // it in other states (the old behavior always set "FINISHED") makes
+    // some senders treat the session as terminated.
+    let mut status = json!({
+        "mediaSessionId": 1,
+        "playbackRate": 1,
+        "playerState": player_state,
+        "currentTime": 0,
+        "supportedMediaCommands": 15,
+        "volume": {
+            "level": 1.0,
+            "muted": false
+        }
+    });
+    if player_state == "IDLE" && !idle_reason.is_empty() {
+        // json!({...}) always yields an Object; expect() just documents
+        // the invariant rather than allowing a silent no-op.
+        status
+            .as_object_mut()
+            .expect("json! object literal is always an Object")
+            .insert(
+                "idleReason".into(),
+                Value::String(idle_reason.to_string()),
+            );
+    }
     json!({
         "type": "MEDIA_STATUS",
         "requestId": request_id,
-        "status": [
-            {
-                "mediaSessionId": 1,
-                "playbackRate": 1,
-                "playerState": player_state,
-                "idleReason": idle_reason,
-                "currentTime": 0,
-                "supportedMediaCommands": 15,
-                "volume": {
-                    "level": 1.0,
-                    "muted": false
-                }
-            }
-        ]
+        "status": [status]
     })
 }
 
@@ -471,4 +581,130 @@ fn rand_hex_u64() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0x1234567890ABCDEF)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_message() -> CastMessage {
+        CastMessage {
+            protocol_version: 0,
+            source_id: "sender-0".into(),
+            destination_id: "receiver-0".into(),
+            namespace: "urn:x-cast:com.google.cast.media".into(),
+            payload_type: 0,
+            payload_utf8: Some("{\"type\":\"LOAD\",\"requestId\":42}".into()),
+            payload_binary: None,
+        }
+    }
+
+    #[test]
+    fn encode_then_decode_roundtrip() {
+        let msg = sample_message();
+        let mut buf = Vec::new();
+        msg.encode(&mut buf);
+
+        let decoded = CastMessage::decode(&buf).expect("decode");
+        assert_eq!(decoded.protocol_version, msg.protocol_version);
+        assert_eq!(decoded.source_id, msg.source_id);
+        assert_eq!(decoded.destination_id, msg.destination_id);
+        assert_eq!(decoded.namespace, msg.namespace);
+        assert_eq!(decoded.payload_type, msg.payload_type);
+        assert_eq!(decoded.payload_utf8, msg.payload_utf8);
+        assert_eq!(decoded.payload_binary, msg.payload_binary);
+    }
+
+    #[test]
+    fn decode_skips_unknown_fixed64() {
+        // Real protobuf: tag=100, wire=1 (fixed64), then 8 bytes, then
+        // our known tag=2 (source_id, wire=2). A strict decoder would
+        // reject; we should skip the fixed64 and still read source_id.
+        let mut buf = Vec::new();
+        // tag 100 (field 100, wire 1) = (100<<3)|1 = 801
+        encode_varint(&mut buf, 801);
+        buf.extend_from_slice(&[0u8; 8]); // 8-byte payload
+        // tag 2 wire 2 = 18
+        encode_varint(&mut buf, 18);
+        encode_varint(&mut buf, 5);
+        buf.extend_from_slice(b"hello");
+
+        let decoded = CastMessage::decode(&buf).expect("decode");
+        assert_eq!(decoded.source_id, "hello");
+    }
+
+    #[test]
+    fn decode_skips_unknown_fixed32() {
+        let mut buf = Vec::new();
+        // tag 50 wire 5 (fixed32) = (50<<3)|5 = 405
+        encode_varint(&mut buf, 405);
+        buf.extend_from_slice(&[0u8; 4]);
+        // tag 4 wire 2 (namespace)
+        encode_varint(&mut buf, 34);
+        encode_varint(&mut buf, 3);
+        buf.extend_from_slice(b"urn");
+
+        let decoded = CastMessage::decode(&buf).expect("decode");
+        assert_eq!(decoded.namespace, "urn");
+    }
+
+    #[test]
+    fn decode_truncated_fixed64_errors() {
+        let mut buf = Vec::new();
+        encode_varint(&mut buf, 801); // tag 100 fixed64
+        buf.extend_from_slice(&[0u8; 4]); // only 4 bytes instead of 8
+        assert!(CastMessage::decode(&buf).is_err());
+    }
+
+    #[test]
+    fn decode_varint_truncated_errors() {
+        // A lone 0x80 byte (continuation bit set) with nothing following
+        // must not loop forever or panic.
+        assert!(CastMessage::decode(&[0x80]).is_err());
+    }
+
+    #[test]
+    fn extract_url_prefers_content_url() {
+        let p = serde_json::json!({
+            "media": {
+                "contentUrl": "http://a",
+                "contentId": "http://b",
+                "entity": "http://c",
+            }
+        });
+        assert_eq!(extract_url_from_load(&p).as_deref(), Some("http://a"));
+    }
+
+    #[test]
+    fn extract_url_falls_back_through_content_id_and_entity() {
+        let p = serde_json::json!({
+            "media": {
+                "contentId": "http://b",
+                "entity": "http://c",
+            }
+        });
+        assert_eq!(extract_url_from_load(&p).as_deref(), Some("http://b"));
+
+        let p = serde_json::json!({
+            "media": { "entity": "http://c" }
+        });
+        assert_eq!(extract_url_from_load(&p).as_deref(), Some("http://c"));
+    }
+
+    #[test]
+    fn extract_url_empty_values_skipped() {
+        let p = serde_json::json!({
+            "media": {
+                "contentUrl": "",
+                "contentId": "http://b",
+            }
+        });
+        assert_eq!(extract_url_from_load(&p).as_deref(), Some("http://b"));
+    }
+
+    #[test]
+    fn extract_url_missing_returns_none() {
+        let p = serde_json::json!({"media": {}});
+        assert_eq!(extract_url_from_load(&p), None);
+    }
 }
