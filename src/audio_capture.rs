@@ -15,8 +15,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use chacha20poly1305::aead::{Aead, KeyInit, Payload};
-use chacha20poly1305::{ChaCha20Poly1305, Nonce};
+use chacha20poly1305::aead::{AeadInPlace, KeyInit};
+use chacha20poly1305::{ChaCha20Poly1305, Nonce, Tag};
 use tokio::net::UdpSocket;
 use tracing::{debug, warn};
 
@@ -51,7 +51,7 @@ pub async fn run_capture(
 ) -> Result<()> {
     let cipher: Option<ChaCha20Poly1305> = shk
         .as_deref()
-        .map(|key| ChaCha20Poly1305::new_from_slice(key))
+        .map(ChaCha20Poly1305::new_from_slice)
         .transpose()
         .context("invalid SHK length for ChaCha20-Poly1305")?;
 
@@ -62,6 +62,9 @@ pub async fn run_capture(
         .with_context(|| format!("failed to create output file: {output_path}"))?;
 
     let mut buf = vec![0u8; 8192];
+    // Reusable scratch buffer for decrypted audio payload; cleared and
+    // refilled per packet so we don't allocate a new Vec every RTP frame.
+    let mut audio = Vec::with_capacity(2048);
     let mut pkt_count: u64 = 0;
 
     debug!(
@@ -87,7 +90,7 @@ pub async fn run_capture(
                     break;
                 }
                 Ok(Ok(n)) => {
-                    if let Some(audio) = handle_packet(&buf[..n], cipher.as_ref()) {
+                    if decode_packet_into(&buf[..n], cipher.as_ref(), &mut audio) {
                         write_frame(&mut file, &audio).await?;
                         pkt_count += 1;
                     }
@@ -100,7 +103,7 @@ pub async fn run_capture(
                     break;
                 }
                 Ok(n) => {
-                    if let Some(audio) = handle_packet(&buf[..n], cipher.as_ref()) {
+                    if decode_packet_into(&buf[..n], cipher.as_ref(), &mut audio) {
                         write_frame(&mut file, &audio).await?;
                         pkt_count += 1;
                     }
@@ -114,12 +117,18 @@ pub async fn run_capture(
     Ok(())
 }
 
-/// Decode one RTP packet and return the raw AAC frame, or `None` if the packet
-/// is too short / decryption fails.
-fn handle_packet(data: &[u8], cipher: Option<&ChaCha20Poly1305>) -> Option<Vec<u8>> {
+/// Decode one RTP packet into the caller's reusable `out` buffer.
+/// Returns true when `out` contains a valid AAC frame.
+fn decode_packet_into(
+    data: &[u8],
+    cipher: Option<&ChaCha20Poly1305>,
+    out: &mut Vec<u8>,
+) -> bool {
+    out.clear();
+
     // Minimum: 12 (RTP header) + 1 (payload) + 16 (tag) + 8 (nonce)
     if data.len() < 37 {
-        return None;
+        return false;
     }
 
     let nonce_bytes = &data[data.len() - 8..];
@@ -128,7 +137,7 @@ fn handle_packet(data: &[u8], cipher: Option<&ChaCha20Poly1305>) -> Option<Vec<u
     let payload = &data[12..data.len() - 24];
 
     if payload.is_empty() {
-        return None;
+        return false;
     }
 
     if let Some(cipher) = cipher {
@@ -137,23 +146,24 @@ fn handle_packet(data: &[u8], cipher: Option<&ChaCha20Poly1305>) -> Option<Vec<u
         nonce_arr[4..].copy_from_slice(nonce_bytes);
         let nonce = Nonce::from(nonce_arr);
 
-        // Concatenate ciphertext + tag as required by chacha20poly1305 crate.
-        let mut ct_with_tag = Vec::with_capacity(payload.len() + 16);
-        ct_with_tag.extend_from_slice(payload);
-        ct_with_tag.extend_from_slice(tag);
+        let tag_arr: [u8; 16] = match tag.try_into() {
+            Ok(a) => a,
+            Err(_) => return false,
+        };
+        let tag_obj = Tag::from(tag_arr);
 
-        match cipher.decrypt(
-            &nonce,
-            Payload {
-                msg: &ct_with_tag,
-                aad,
-            },
-        ) {
-            Ok(pt) => Some(pt),
-            Err(_) => None, // Decryption failed — might be a control packet
+        out.extend_from_slice(payload);
+
+        match cipher.decrypt_in_place_detached(&nonce, aad, out, &tag_obj) {
+            Ok(()) => true,
+            Err(_) => {
+                out.clear();
+                false // Decryption failed — might be a control packet
+            }
         }
     } else {
-        Some(payload.to_vec())
+        out.extend_from_slice(payload);
+        true
     }
 }
 
