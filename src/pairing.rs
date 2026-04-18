@@ -485,6 +485,14 @@ impl HapSession {
                 self.encrypted = true;
                 tlv::encode(&[(tag::STATE, &[0x04]), (tag::PROOF, &m2)])
             }
+            // M5: HomeKit clients that see feature bit 46 will attempt the
+            // full pairing flow with long-term identity exchange. We only
+            // implement transient pairing (bit 48). Reply M6 with
+            // Unavailable (0x06) so the client gracefully falls back to
+            // transient rather than treating us as broken.
+            0x05 => {
+                tlv::encode(&[(tag::STATE, &[0x06]), (tag::ERROR, &[0x06])])
+            }
             _ => tlv::encode(&[(tag::STATE, &[0x04]), (tag::ERROR, &[0x02])]),
         }
     }
@@ -510,7 +518,7 @@ impl HapSession {
                 };
                 let client_pub = X25519PublicKey::from(client_pub_arr);
                 let shared = secret.diffie_hellman(&client_pub);
-                let shared_bytes = shared.as_bytes().clone();
+                let shared_bytes = *shared.as_bytes();
 
                 let prk = hkdf_extract_sha256(b"Pair-Verify-Encrypt-Salt", &shared_bytes);
                 let session_key_vec =
@@ -608,6 +616,8 @@ fn derive_hap_keys(shared_key: &[u8]) -> ([u8; 32], [u8; 32]) {
 }
 
 const HAP_BLOCK_SIZE: usize = 1024;
+/// Each HAP frame adds 2 bytes (AAD length) + 16 bytes (Poly1305 tag).
+const HAP_FRAME_OVERHEAD: usize = 18;
 
 /// Stateful encrypt/decrypt codec for the HAP encrypted control channel.
 pub struct HapCodec {
@@ -630,7 +640,12 @@ impl HapCodec {
 
     /// Encrypt plaintext into HAP framed ciphertext (may contain multiple blocks).
     pub fn encrypt(&mut self, data: &[u8]) -> Vec<u8> {
-        let mut out = Vec::new();
+        // Output size is exactly data.len() + one frame overhead per chunk.
+        // Pre-sizing saves a growth realloc when the plaintext is larger
+        // than the Vec's default capacity — hot path for every response
+        // written through ConnBuf::write_all.
+        let chunk_count = data.len().div_ceil(HAP_BLOCK_SIZE).max(1);
+        let mut out = Vec::with_capacity(data.len() + chunk_count * HAP_FRAME_OVERHEAD);
         for chunk in data.chunks(HAP_BLOCK_SIZE) {
             let length = chunk.len() as u16;
             let aad = length.to_le_bytes();
@@ -646,7 +661,11 @@ impl HapCodec {
     /// Decrypt HAP framed ciphertext back into plaintext.
     /// Consumes as many complete frames as are present in `data`.
     pub fn decrypt(&mut self, data: &[u8]) -> Vec<u8> {
-        let mut out = Vec::new();
+        // Plaintext is at most `data.len() - chunks * HAP_FRAME_OVERHEAD`.
+        // Round to data.len() since we don't know the chunk count yet —
+        // still a tight upper bound that avoids reallocation for the
+        // common single-frame case.
+        let mut out = Vec::with_capacity(data.len());
         let mut pos = 0;
         while pos + 2 <= data.len() {
             let length = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
@@ -662,13 +681,139 @@ impl HapCodec {
                     self.in_counter += 1;
                 }
                 Err(_) => {
-                    // decryption failure — stop processing
+                    // Authentication failure — either a tampered frame,
+                    // out-of-sync counter, or a control packet slipped in
+                    // on the same TCP stream. Stop and let the caller
+                    // handle the partial decode; logging here aids
+                    // debugging since the symptom otherwise is a
+                    // mysteriously stalled session.
+                    tracing::debug!(
+                        "HAP decrypt failed at counter {} (frame_len={})",
+                        self.in_counter,
+                        frame_end - pos - 2
+                    );
                     break;
                 }
             }
             pos = frame_end;
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tlv_roundtrip_simple() {
+        let encoded = tlv::encode(&[
+            (tag::STATE, &[0x02]),
+            (tag::PUBLICKEY, &[1, 2, 3, 4, 5]),
+        ]);
+        let decoded = tlv::decode(&encoded);
+        assert_eq!(decoded.get(&tag::STATE), Some(&vec![0x02]));
+        assert_eq!(decoded.get(&tag::PUBLICKEY), Some(&vec![1, 2, 3, 4, 5]));
+    }
+
+    #[test]
+    fn tlv_long_value_is_chunked_into_255_byte_pieces() {
+        // TLV8 length field is a single byte, so values longer than 255
+        // bytes must be split into multiple same-tag runs on encode and
+        // re-concatenated on decode.
+        let long = vec![0xAAu8; 600];
+        let encoded = tlv::encode(&[(tag::ENCRYPTEDDATA, &long)]);
+        // 600 bytes → 255 + 255 + 90, three runs, each with 2-byte header
+        assert_eq!(encoded.len(), 600 + 3 * 2);
+        let decoded = tlv::decode(&encoded);
+        assert_eq!(decoded.get(&tag::ENCRYPTEDDATA), Some(&long));
+    }
+
+    #[test]
+    fn tlv_truncated_input_doesnt_panic() {
+        // A TLV with len=100 but only 10 bytes of value must not panic.
+        let bad = [tag::PROOF, 100, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        let _ = tlv::decode(&bad);
+    }
+
+    #[test]
+    fn pair_setup_m1_produces_m2() {
+        let ltsk = SigningKey::from_bytes(&[0x42; 32]);
+        let mut session = HapSession::new(ltsk);
+        let m1 = tlv::encode(&[(tag::STATE, &[0x01])]);
+        let m2_bytes = session.pair_setup(&m1);
+        let m2 = tlv::decode(&m2_bytes);
+        assert_eq!(m2.get(&tag::STATE), Some(&vec![0x02]));
+        assert!(m2.contains_key(&tag::SALT), "M2 must carry salt");
+        assert!(m2.contains_key(&tag::PUBLICKEY), "M2 must carry B");
+    }
+
+    #[test]
+    fn pair_setup_m5_returns_m6_unavailable() {
+        // HomeKit clients sometimes try non-transient pair-setup after
+        // transient is offered. We must reply with STATE=6 ERROR=0x06
+        // (Unavailable) so they fall back gracefully.
+        let ltsk = SigningKey::from_bytes(&[0x42; 32]);
+        let mut session = HapSession::new(ltsk);
+        let m5 = tlv::encode(&[(tag::STATE, &[0x05])]);
+        let resp = tlv::decode(&session.pair_setup(&m5));
+        assert_eq!(resp.get(&tag::STATE), Some(&vec![0x06]));
+        assert_eq!(resp.get(&tag::ERROR), Some(&vec![0x06]));
+    }
+
+    #[test]
+    fn hap_codec_roundtrip_small() {
+        let shared = [0x33u8; 64];
+        let mut a = HapCodec::new(&shared);
+        let mut b = HapCodec::new(&shared);
+
+        // Encrypt out → decrypt in; swap roles by swapping the keys.
+        // For a roundtrip we encode with out-key and decode with
+        // out-key too (same codec instance mirrors both sides).
+        let ct = a.encrypt(b"hello world");
+        // The receiver side uses its own codec with flipped role —
+        // which here means b.out_key == a.in_key; easiest check is
+        // a → b flow: a encrypts with out, b decrypts with in.
+        // Derived keys are symmetric on construction: both sides
+        // derive the same pair — out on one is in on the other.
+        // So we swap keys on b.
+        std::mem::swap(&mut b.out_key, &mut b.in_key);
+        let pt = b.decrypt(&ct);
+        assert_eq!(&pt, b"hello world");
+    }
+
+    #[test]
+    fn hap_codec_multi_block_is_framed() {
+        // Plaintext larger than one HAP block should produce multiple
+        // frames each with its own 2-byte AAD length prefix + 16-byte tag.
+        let shared = [0x77u8; 64];
+        let mut a = HapCodec::new(&shared);
+        let mut b = HapCodec::new(&shared);
+        std::mem::swap(&mut b.out_key, &mut b.in_key);
+
+        let plaintext = vec![0xABu8; 2500]; // > 2 full HAP blocks
+        let ct = a.encrypt(&plaintext);
+        // 2500 bytes: chunks of 1024 + 1024 + 452, three frames
+        // ct length = 2500 + 3*(2+16) = 2554
+        assert_eq!(ct.len(), 2554);
+
+        let pt = b.decrypt(&ct);
+        assert_eq!(pt, plaintext);
+    }
+
+    #[test]
+    fn fairplay_setup_known_modes() {
+        // Mode 0..3 each map to a fixed hard-coded reply; mode >=4 → None.
+        // FP_REPLIES[mode][13] is the mode index inside the static reply,
+        // which is the stable byte to identify which reply came back.
+        let mut req = vec![0x46, 0x50, 0x4c, 0x59, 0x03, 0x01, 0x01, 0, 0, 0, 0, 0, 0, 0, 0];
+        for mode in 0u8..4 {
+            req[14] = mode;
+            let r = fairplay_setup(&req).expect("mode should produce reply");
+            assert_eq!(r[13], mode, "reply should be FP_REPLIES[{mode}]");
+        }
+        req[14] = 5;
+        assert!(fairplay_setup(&req).is_none(), "unknown mode → None");
     }
 }
 

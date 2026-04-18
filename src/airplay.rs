@@ -44,26 +44,56 @@ const FEATURES: u64 = (1 << 48)  // TransientPairing
     | (1 << 4)   // VideoHTTPLiveStreaming
     | (1 << 0); // Video
 
-/// Derive a stable device ID from the machine's MAC address.
+/// Derive a stable device ID from the machine's MAC address. Prefers a
+/// physical (Ethernet/WiFi) interface so VPN (utun*), Tailscale, or
+/// Docker bridge MACs aren't exposed as the device identity — those
+/// rotate per session and would prevent iOS from caching our receiver.
 fn get_device_id() -> String {
-    use network_interface::{Addr, NetworkInterface, NetworkInterfaceConfig};
-    if let Ok(ifaces) = NetworkInterface::show() {
+    use network_interface::{NetworkInterface, NetworkInterfaceConfig};
+    let ifaces = match NetworkInterface::show() {
+        Ok(v) => v,
+        Err(_) => return "AA:BB:CC:DD:EE:FF".to_string(),
+    };
+
+    let pick = |filter: fn(&str) -> bool| -> Option<String> {
         for iface in &ifaces {
+            if !filter(&iface.name) {
+                continue;
+            }
             if let Some(mac) = &iface.mac_addr {
-                let mac = mac.to_uppercase();
-                if mac != "00:00:00:00:00:00" && !mac.is_empty() {
-                    return mac;
+                let mac_u = mac.to_uppercase();
+                if mac_u != "00:00:00:00:00:00" && !mac_u.is_empty() {
+                    return Some(mac_u);
                 }
             }
         }
-    }
-    "AA:BB:CC:DD:EE:FF".to_string()
+        None
+    };
+
+    pick(crate::net::is_physical)
+        .or_else(|| pick(|_| true))
+        .unwrap_or_else(|| "AA:BB:CC:DD:EE:FF".to_string())
 }
 
 use std::sync::LazyLock;
 static DEVICE_ID: LazyLock<String> = LazyLock::new(get_device_id);
 const PI: &str = "2e388006-13ba-4041-9a67-25dd4a43d536";
 const SRCVERS: &str = "366.0";
+
+/// Fresh Ed25519 seed per run. A previous iteration persisted the seed
+/// across runs to let iOS reuse cached pair-setup state — but this tool
+/// is a one-shot URL capture that exits after the first hit, and the
+/// UPnP `device_uuid` is already regenerated each invocation. Keeping
+/// `pk` stable while the rest of our identity rotates is inconsistent,
+/// and — more importantly — iOS's negative cache of prior failed pair
+/// attempts would then taint every subsequent capture. A fresh pk each
+/// run is the intended behavior: we impersonate a brand-new TV every
+/// time the sender opens its picker.
+fn fresh_ltsk() -> SigningKey {
+    let mut seed = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut seed);
+    SigningKey::from_bytes(&seed)
+}
 
 struct AirPlayState {
     friendly_name: String,
@@ -103,11 +133,7 @@ impl AirPlayReceiver {
     }
 
     pub async fn run(self, mut stop_rx: tokio::sync::watch::Receiver<()>) -> Result<()> {
-        let ltsk = SigningKey::from_bytes(&{
-            let mut seed = [0u8; 32];
-            rand::thread_rng().fill_bytes(&mut seed);
-            seed
-        });
+        let ltsk = fresh_ltsk();
 
         let state = Arc::new(AirPlayState {
             friendly_name: self.friendly_name.clone(),
@@ -144,12 +170,19 @@ impl AirPlayReceiver {
         properties.insert("protovers".to_string(), "1.1".to_string());
         properties.insert("vv".to_string(), "2".to_string());
         properties.insert("acl".to_string(), "0".to_string());
+        // Extra TXT keys some iOS builds probe for. Empty/defaults are fine —
+        // missing keys occasionally cause pyatv/iOS to treat the device as
+        // "partial" and skip it in the picker.
+        properties.insert("rsf".to_string(), "0x0".to_string());
+        properties.insert("gid".to_string(), PI.to_string());
+        properties.insert("gcgl".to_string(), "0".to_string());
+        properties.insert("igl".to_string(), "0".to_string());
 
         let svc_info = ServiceInfo::new(
             "_airplay._tcp.local.",
             &self.friendly_name,
             &format!("{}.local.", self.local_ip.replace('.', "-")),
-            &ip_parsed.to_string(),
+            ip_parsed.to_string(),
             self.port,
             Some(properties),
         )
@@ -372,6 +405,9 @@ struct Response {
     extra_headers: Vec<(String, String)>,
     version: String, // "HTTP/1.1" or "RTSP/1.0"
     cseq: Option<String>,
+    /// If true, caller should stop parsing further requests after sending.
+    /// Used for `POST /reverse` (HTTP upgrade → PTTH/1.0 event channel).
+    upgrade: bool,
 }
 
 impl Response {
@@ -383,6 +419,7 @@ impl Response {
             extra_headers: Vec::new(),
             version: version.to_string(),
             cseq: None,
+            upgrade: false,
         }
     }
 
@@ -396,26 +433,49 @@ impl Response {
         self
     }
 
+    fn with_upgrade(mut self) -> Self {
+        self.upgrade = true;
+        self
+    }
+
     fn to_bytes(&self) -> Vec<u8> {
         let status_text = match self.status {
+            101 => "Switching Protocols",
             200 => "OK",
             204 => "No Content",
+            400 => "Bad Request",
+            404 => "Not Found",
             _ => "OK",
         };
-        let mut out = format!(
-            "{} {} {}\r\n",
-            self.version, self.status, status_text
-        );
-        // Python's BaseHTTPRequestHandler sends Server header automatically.
+        // Estimate capacity to avoid repeated re-allocation on writes.
+        let mut out = String::with_capacity(192 + self.body.len());
+        out.push_str(&self.version);
+        out.push(' ');
+        out.push_str(&self.status.to_string());
+        out.push(' ');
+        out.push_str(status_text);
+        out.push_str("\r\n");
         // iOS checks for "AirTunes/" in some pairing flows.
         out.push_str("Server: AirTunes/366.0\r\n");
         if let Some(cseq) = &self.cseq {
-            out.push_str(&format!("CSeq: {}\r\n", cseq));
+            out.push_str("CSeq: ");
+            out.push_str(cseq);
+            out.push_str("\r\n");
         }
-        out.push_str(&format!("Content-Type: {}\r\n", self.content_type));
-        out.push_str(&format!("Content-Length: {}\r\n", self.body.len()));
+        // 101 Upgrade responses must not advertise Content-Type/Length.
+        if self.status != 101 {
+            out.push_str("Content-Type: ");
+            out.push_str(self.content_type);
+            out.push_str("\r\n");
+            out.push_str("Content-Length: ");
+            out.push_str(&self.body.len().to_string());
+            out.push_str("\r\n");
+        }
         for (k, v) in &self.extra_headers {
-            out.push_str(&format!("{}: {}\r\n", k, v));
+            out.push_str(k);
+            out.push_str(": ");
+            out.push_str(v);
+            out.push_str("\r\n");
         }
         out.push_str("\r\n");
         let mut bytes = out.into_bytes();
@@ -454,6 +514,7 @@ async fn handle_connection(stream: TcpStream, state: Arc<AirPlayState>) -> Resul
         )
         .await;
 
+        let upgrade = resp.upgrade;
         let resp_bytes = resp
             .with_cseq(cseq)
             .to_bytes();
@@ -463,12 +524,29 @@ async fn handle_connection(stream: TcpStream, state: Arc<AirPlayState>) -> Resul
             break;
         }
 
-        if hap.is_encrypted() && !is_encrypted {
-            if let Some(key) = hap.shared_key() {
-                conn.enable_encryption(key);
-                is_encrypted = true;
-                debug!("AirPlay: connection upgraded to HAP encryption");
+        if upgrade {
+            // /reverse upgraded to PTTH/1.0. The socket stays open so iOS can
+            // receive server-pushed events; we never push any. Drain passively
+            // until iOS closes from its side — trying to parse requests here
+            // is wrong since the role has inverted.
+            debug!("AirPlay: /reverse upgraded, entering passive drain");
+            let mut drain = [0u8; 1024];
+            loop {
+                match conn.stream.read(&mut drain).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => continue,
+                }
             }
+            break;
+        }
+
+        if hap.is_encrypted()
+            && !is_encrypted
+            && let Some(key) = hap.shared_key()
+        {
+            conn.enable_encryption(key);
+            is_encrypted = true;
+            debug!("AirPlay: connection upgraded to HAP encryption");
         }
     }
 
@@ -492,6 +570,10 @@ async fn handle_request(
         "GET" => match path {
             "/server-info" | "/info" => send_device_info(version, hap, state),
             "/playback-info" => send_playback_info(version, state),
+            // iOS may probe /getProperty/<name> for playbackAccessLog,
+            // playbackErrorLog, forwardEndTime, reverseEndTime. Silent 200
+            // is enough for URL capture.
+            p if p.starts_with("/getProperty") => ok_empty(version),
             _ => ok_empty(version),
         },
 
@@ -514,15 +596,35 @@ async fn handle_request(
                     ok_empty(version)
                 }
             }
+            // iOS 17+ opens /reverse as an HTTP Upgrade channel for
+            // server-pushed events (PTTH/1.0). A non-101 reply here causes
+            // some iOS builds to abort the whole session. We return 101
+            // and then keep the socket idle — we never push events.
+            "/reverse" => Response::new(version, 101, Vec::new(), "application/octet-stream")
+                .with_header("Upgrade", "PTTH/1.0")
+                .with_header("Connection", "Upgrade")
+                .with_upgrade(),
+            // Sent when FairPlay bit is advertised. 200 empty satisfies the
+            // minimum handshake when no real FairPlay key derivation follows.
+            "/auth-setup" => ok_empty(version),
+            // Media control endpoints. We don't actually play anything, so
+            // all are acknowledged with 200 empty — but handling them
+            // explicitly documents the state machine and avoids iOS
+            // treating the fallthrough as an error on strict builds.
+            "/scrub" | "/rate" | "/stop" | "/feedback" | "/command"
+            | "/audioMode" | "/configure" | "/setProperty"
+            | "/pair-setup-pin" | "/pair-pin-start" | "/authorize"
+            | "/photo" | "/slideshows" => ok_empty(version),
             _ => ok_empty(version),
         },
 
+        // Several iOS endpoints use PUT for updates (e.g. /setProperty/<name>).
         "PUT" => ok_empty(version),
 
         "OPTIONS" => Response::new(version, 200, Vec::new(), "application/octet-stream")
             .with_header(
                 "Public",
-                "ANNOUNCE, SETUP, RECORD, PAUSE, FLUSH, \
+                "ANNOUNCE, SETUP, RECORD, PAUSE, FLUSH, FLUSHBUFFERED, \
                  TEARDOWN, OPTIONS, GET_PARAMETER, SET_PARAMETER, POST, GET",
             ),
 
@@ -538,7 +640,8 @@ async fn handle_request(
             }
         }
 
-        "RECORD" | "FLUSH" | "SETPEERS" | "SET_PARAMETER" | "ANNOUNCE" => ok_empty(version),
+        "RECORD" | "FLUSH" | "FLUSHBUFFERED" | "SETPEERS" | "SET_PARAMETER" | "ANNOUNCE"
+        | "PAUSE" => ok_empty(version),
 
         _ => ok_empty(version),
     }
@@ -571,22 +674,21 @@ fn send_device_info(version: &str, hap: &HapSession, state: &AirPlayState) -> Re
     Response::new(version, 200, buf, "application/x-apple-binary-plist")
 }
 
-fn send_playback_info(version: &str, state: &Arc<AirPlayState>) -> Response {
-    let captured = state
-        .captured
-        .load(std::sync::atomic::Ordering::Relaxed);
-
-    let rate = if captured { 0.0f64 } else { 1.0f64 };
-    let ready = !captured;
-
+fn send_playback_info(version: &str, _state: &Arc<AirPlayState>) -> Response {
+    // Always report "playing" — during the pre-capture phase so iOS
+    // doesn't bail early, and during the post-capture linger phase so
+    // the user's casting UI stays on "playing to TV" for a few seconds
+    // before the process exits. Claiming "not ready" after capture (the
+    // old behavior) made the iOS UI flip to "stopped" and tempted users
+    // into retapping cast repeatedly.
     let mut d = plist::Dictionary::new();
     d.insert("duration".into(), plist::Value::Real(0.0));
     d.insert("position".into(), plist::Value::Real(0.0));
-    d.insert("rate".into(), plist::Value::Real(rate));
-    d.insert("readyToPlay".into(), plist::Value::Boolean(ready));
-    d.insert("playbackBufferEmpty".into(), plist::Value::Boolean(true));
-    d.insert("playbackBufferFull".into(), plist::Value::Boolean(false));
-    d.insert("playbackLikelyToKeepUp".into(), plist::Value::Boolean(ready));
+    d.insert("rate".into(), plist::Value::Real(1.0));
+    d.insert("readyToPlay".into(), plist::Value::Boolean(true));
+    d.insert("playbackBufferEmpty".into(), plist::Value::Boolean(false));
+    d.insert("playbackBufferFull".into(), plist::Value::Boolean(true));
+    d.insert("playbackLikelyToKeepUp".into(), plist::Value::Boolean(true));
 
     let mut buf = Vec::new();
     if plist::to_writer_xml(&mut buf, &plist::Value::Dictionary(d)).is_err() {
@@ -604,24 +706,23 @@ fn handle_play(
     let content_type = headers.get("content-type").map(|s| s.as_str()).unwrap_or("");
     let mut url: Option<String> = None;
 
-    if content_type.contains("binary-plist") || content_type.contains("x-apple") {
-        if let Ok(plist::Value::Dictionary(d)) = plist::from_bytes::<plist::Value>(body) {
-            if let Some(plist::Value::String(s)) = d.get("Content-Location") {
-                url = Some(s.clone());
-            }
-        }
+    if (content_type.contains("binary-plist") || content_type.contains("x-apple"))
+        && let Ok(plist::Value::Dictionary(d)) = plist::from_bytes::<plist::Value>(body)
+        && let Some(plist::Value::String(s)) = d.get("Content-Location")
+    {
+        url = Some(s.clone());
     }
 
-    if url.is_none() {
-        if let Ok(text) = std::str::from_utf8(body) {
-            for line in text.lines() {
-                let trimmed = line.trim();
-                if let Some(rest) = trimmed.strip_prefix("Content-Location:") {
-                    let val = rest.trim();
-                    if !val.is_empty() {
-                        url = Some(val.to_string());
-                        break;
-                    }
+    if url.is_none()
+        && let Ok(text) = std::str::from_utf8(body)
+    {
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("Content-Location:") {
+                let val = rest.trim();
+                if !val.is_empty() {
+                    url = Some(val.to_string());
+                    break;
                 }
             }
         }
