@@ -30,7 +30,6 @@ pub mod upnp;
 
 use std::sync::Arc;
 use tokio::sync::watch;
-use tracing::warn;
 
 /// Supported casting protocols.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -82,6 +81,16 @@ pub struct CaptureOptions {
     pub audio_output: Option<String>,
     /// Optional recording duration in seconds.
     pub audio_duration: Option<f64>,
+    /// How long to keep the protocol handlers running after a URL has
+    /// been captured, while continuing to respond with "playing" state
+    /// to the sender. Without this, the sender's phone UI flips to
+    /// "cast failed" the instant the process tears down, which users
+    /// read as "try again" and retap the cast button repeatedly. A
+    /// few seconds of feigned-playback buys the psychological
+    /// "cast succeeded" verdict before we disappear.
+    ///
+    /// Default: 3 seconds. Set to 0 to disable (immediate shutdown).
+    pub post_capture_linger: std::time::Duration,
 }
 
 impl Default for CaptureOptions {
@@ -93,6 +102,7 @@ impl Default for CaptureOptions {
             bind: None,
             audio_output: None,
             audio_duration: None,
+            post_capture_linger: std::time::Duration::from_secs(3),
         }
     }
 }
@@ -101,9 +111,20 @@ impl Default for CaptureOptions {
 ///
 /// Returns the captured stream/video URL.
 pub async fn capture(opts: CaptureOptions) -> anyhow::Result<String> {
-    let local_ip = match opts.bind {
-        Some(ref val) => net::resolve_bind(val)?,
-        None => net::get_lan_ip()?,
+    // Primary IP used for mDNS advertisement (AirPlay/Cast) and the
+    // banner messages. When `bind` is None we also pick up every other
+    // private IPv4 and spin up an additional SSDP advertiser per
+    // interface so DLNA works across VLANs/wifi/ethernet seams.
+    let (local_ip, ssdp_ips) = match opts.bind {
+        Some(ref val) => {
+            let ip = net::resolve_bind(val)?;
+            (ip.clone(), vec![ip])
+        }
+        None => {
+            let all = net::all_lan_ipv4()?;
+            let primary = all[0].clone();
+            (primary, all)
+        }
     };
     let dev_uuid = format!("uuid:{}", uuid::Uuid::new_v4());
 
@@ -117,34 +138,55 @@ pub async fn capture(opts: CaptureOptions) -> anyhow::Result<String> {
 
     if opts.protocols.contains(&Protocol::Dlna) {
         let port = opts.port;
-        let location = format!("http://{}:{}/device.xml", local_ip, port);
         let server = Arc::new(upnp::UpnpServer::new(
             dev_uuid.clone(),
             opts.name.clone(),
             (*url_tx).clone(),
         ));
-        let ssdp_adv = ssdp::SsdpAdvertiser::new(
-            dev_uuid.clone(),
-            location,
-            local_ip.clone(),
-        );
 
-        let stop1 = stop_rx.clone();
-        let stop2 = stop_rx.clone();
-
+        let stop_srv = stop_rx.clone();
         handles.push(tokio::spawn(async move {
-            if let Err(e) = server.run(port, stop1).await {
-                warn!("DLNA server error: {e}");
+            if let Err(e) = server.run(port, stop_srv).await {
+                // Bind failures (port already in use) and similar fatal
+                // startup errors need to be visible without --verbose,
+                // otherwise the user sees the banner but wonders why
+                // no device shows up in their cast picker.
+                eprintln!("  ⚠️ DLNA server error: {e}");
             }
         }));
-        handles.push(tokio::spawn(async move {
-            if let Err(e) = ssdp_adv.run(stop2).await {
-                warn!("SSDP error: {e}");
-            }
-        }));
+
+        // One SSDP advertiser per usable interface. Each uses its own
+        // LOCATION URL so controllers see a reachable address for the
+        // subnet they queried from. They share the stop channel and
+        // all publish the same device_uuid.
+        for ip in &ssdp_ips {
+            let location = format!("http://{}:{}/device.xml", ip, port);
+            let ssdp_adv = ssdp::SsdpAdvertiser::new(
+                dev_uuid.clone(),
+                location,
+                ip.clone(),
+            );
+            let stop = stop_rx.clone();
+            let ip_log = ip.clone();
+            handles.push(tokio::spawn(async move {
+                if let Err(e) = ssdp_adv.run(stop).await {
+                    eprintln!("  ⚠️ SSDP error on {ip_log}: {e}");
+                }
+            }));
+        }
 
         started.push(Protocol::Dlna);
-        eprintln!("  📺 DLNA    \"{}\" on {}:{}", opts.name, local_ip, port);
+        if ssdp_ips.len() > 1 {
+            eprintln!(
+                "  📺 DLNA    \"{}\" on {}:{} (advertising on {} interfaces)",
+                opts.name,
+                local_ip,
+                port,
+                ssdp_ips.len()
+            );
+        } else {
+            eprintln!("  📺 DLNA    \"{}\" on {}:{}", opts.name, local_ip, port);
+        }
     }
 
     if opts.protocols.contains(&Protocol::AirPlay) {
@@ -165,7 +207,7 @@ pub async fn capture(opts: CaptureOptions) -> anyhow::Result<String> {
         let stop = stop_rx.clone();
         handles.push(tokio::spawn(async move {
             if let Err(e) = recv.run(stop).await {
-                warn!("AirPlay error: {e}");
+                eprintln!("  ⚠️ AirPlay error: {e}");
             }
         }));
 
@@ -184,7 +226,7 @@ pub async fn capture(opts: CaptureOptions) -> anyhow::Result<String> {
         let stop = stop_rx.clone();
         handles.push(tokio::spawn(async move {
             if let Err(e) = recv.run(stop).await {
-                warn!("Cast error: {e}");
+                eprintln!("  ⚠️ Cast error: {e}");
             }
         }));
 
@@ -207,10 +249,31 @@ pub async fn capture(opts: CaptureOptions) -> anyhow::Result<String> {
         }
     };
 
+    // Post-capture linger: keep every protocol handler alive so the
+    // sender's phone UI keeps seeing a healthy "playing on TV" status
+    // (GetTransportInfo=PLAYING, /playback-info rate=1.0,
+    // Cast MEDIA_STATUS=PLAYING). Without this, the sender sees an
+    // abrupt RST and the UI flips to "cast failed" — which users
+    // interpret as a transient network issue and retap the cast
+    // button repeatedly, spawning new captures after we've already
+    // exited.
+    //
+    // 3s default is enough for iOS/Android cast UIs to settle into
+    // their "playing" affordance; after that the process exits, the
+    // user sees the connection go away mid-playback (which reads as
+    // "TV turned off" rather than "cast failed"), and moves on.
+    if !opts.post_capture_linger.is_zero() {
+        tokio::time::sleep(opts.post_capture_linger).await;
+    }
+
+    // Drop the stop channel so every watcher's `.changed()` fires.
+    // 100ms grace covers SSDP byebye multicast; the protocol TCP
+    // connections are closed by tokio when handles get aborted.
     drop(stop_tx);
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     for h in handles {
         h.abort();
+        let _ = h.await;
     }
 
     Ok(result)

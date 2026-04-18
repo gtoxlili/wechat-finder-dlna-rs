@@ -91,15 +91,35 @@ async fn main() {
         bind: cli.bind,
         audio_output: cli.record.clone(),
         audio_duration: audio_dur,
+        ..Default::default()
     };
 
-    // Use tokio::select! so SIGINT/SIGTERM causes a clean exit
-    // (important when Go's os/exec kills the process group).
+    // Handle SIGINT (Ctrl+C) and SIGTERM separately so a wrapping shell
+    // (Go's os/exec, systemd, docker) can stop us cleanly. Without the
+    // explicit SIGTERM branch, `kill $pid` leaves us running until the
+    // OS sends SIGKILL, which skips the byebye NOTIFYs.
+    #[cfg(unix)]
+    let sigterm = async {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let sigterm = std::future::pending::<()>();
+
     let result = tokio::select! {
         r = capture(opts) => r,
         _ = tokio::signal::ctrl_c() => {
             eprintln!("\n  Interrupted");
             std::process::exit(130);
+        }
+        _ = sigterm => {
+            eprintln!("\n  Terminated");
+            std::process::exit(143);
         }
     };
 
@@ -152,10 +172,10 @@ async fn record_with_ffmpeg(url: &str, output: &str, duration: Option<&str>) {
         Ok(mut child) => {
             tokio::select! {
                 status = child.wait() => {
-                    if let Ok(s) = status {
-                        if s.success() {
-                            eprintln!("\n  Saved to {output}");
-                        }
+                    if let Ok(s) = status
+                        && s.success()
+                    {
+                        eprintln!("\n  Saved to {output}");
                     }
                 }
                 _ = tokio::signal::ctrl_c() => {
